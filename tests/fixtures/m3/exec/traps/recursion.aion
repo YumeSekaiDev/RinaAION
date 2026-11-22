@@ -1,0 +1,6 @@
+fn ping() {
+  do ping();
+}
+fn main() {
+  do ping();
+}

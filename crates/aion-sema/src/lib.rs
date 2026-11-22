@@ -17,7 +17,7 @@ use aion_span::ByteSpan;
 use aion_syntax::{
     Block, BlockIds, Expr, ExprIds, ExprIdsKind, FnIds, ItemIds, NodeId, ParseResult, Stmt, StmtIds,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 // ---------------------------------------------------------------------------
 // Internal types (may contain inference variables)
@@ -95,6 +95,12 @@ struct Checker<'p> {
     /// (`diag_index`, moved-value type snapshot) for each `UseAfterMove`
     /// diagnostic, used by the post-inference soundness filter.
     move_tys: Vec<(usize, Ity)>,
+    /// Candidate move sites: (use-site [`NodeId`], moved-value type
+    /// snapshot) recorded at exactly the sites that feed move behavior
+    /// (call argument, `let` initializer, trailing return). The
+    /// post-inference soundness filter drops `Copy`-resolved entries;
+    /// survivors populate [`aion_sem_model::SemModel::moved_uses`].
+    move_sites: Vec<(NodeId, Ity)>,
     // Union-find over inference variables; `subst[v]` is the bound
     // ground type (or another `Ity::Var`) when resolved.
     subst: Vec<Option<Ity>>,
@@ -202,7 +208,11 @@ impl<'p> Checker<'p> {
     /// Post-inference filter for `UseAfterMove` diagnostics: drop the ones
     /// whose moved value turned out `Copy` once all constraints applied.
     /// Unresolved variables stay owned (kept). Total.
-    fn retain_sound_moves(&mut self) {
+    ///
+    /// Returns the surviving recorded move facts: the use-site [`NodeId`]s
+    /// whose moved value is still owned after final resolution. This is
+    /// the single authoritative move set published on the model.
+    fn retain_sound_moves(&mut self) -> HashSet<NodeId> {
         let subst_len = self.subst.len();
         let resolve_final = |t: &Ity, subst: &[Option<Ity>]| -> Ity {
             let mut cur = t.clone();
@@ -223,7 +233,6 @@ impl<'p> Checker<'p> {
                 }
             }
         };
-        use std::collections::HashSet;
         let ty_of: HashMap<usize, Ity> = self.move_tys.iter().cloned().collect();
         let mut drop_idx = HashSet::new();
         for (i, d) in self.diags.iter().enumerate() {
@@ -249,6 +258,17 @@ impl<'p> Checker<'p> {
             self.diags = diags;
         }
         self.move_tys.clear();
+        let sites = std::mem::take(&mut self.move_sites);
+        let mut kept = HashSet::new();
+        for (id, ty) in sites {
+            match resolve_final(&ty, &self.subst) {
+                Ity::Int | Ity::Bool | Ity::Null | Ity::Unit | Ity::Error | Ity::Fn { .. } => {}
+                _ => {
+                    kept.insert(id);
+                } // Str or still-unknown Var: owned, keep
+            }
+        }
+        kept
     }
 
     /// Controlled diagnostic for AST/index shape mismatches (stale or
@@ -306,12 +326,17 @@ impl<'p> Checker<'p> {
     }
 
     /// Record a move of binding `name` at use site `use_span`.
-    fn mark_moved(&mut self, name: &str, use_span: ByteSpan) {
+    /// `use_site` is the [`NodeId`] of the consuming identifier
+    /// expression and `ty` its type snapshot; on the first (and only
+    /// recorded) move the site is pushed to `move_sites` for the
+    /// post-inference soundness filter. Repeat consumes only diagnose.
+    fn mark_moved(&mut self, name: &str, use_span: ByteSpan, use_site: NodeId, ty: Ity) {
         let hit = self.lookup(name);
         if let Some((depth, mut b)) = hit {
             if !b.moved {
                 b.moved = true;
                 b.move_span = Some(use_span);
+                self.move_sites.push((use_site, ty));
                 if let Some(scope) = self.bindings.get_mut(depth) {
                     scope.insert(name.to_string(), b.clone());
                 }
@@ -420,10 +445,14 @@ impl<'p> Checker<'p> {
                 let _ = node_sp;
 
                 // Ownership: passing a `Str` as a bare identifier moves it.
-                for (a, (t, s)) in args.iter().zip(arg_tys.iter().zip(arg_spans.iter())) {
+                for ((a, a_ids), (t, s)) in args
+                    .iter()
+                    .zip(arg_ids.iter())
+                    .zip(arg_tys.iter().zip(arg_spans.iter()))
+                {
                     if matches!(a, Expr::Ident(_)) && !self.is_copy(t) {
                         if let Expr::Ident(nm) = a {
-                            self.mark_moved(nm, *s);
+                            self.mark_moved(nm, *s, a_ids.node, t.clone());
                         }
                     }
                 }
@@ -625,13 +654,18 @@ impl<'p> Checker<'p> {
 
     /// Check a block in a fresh child scope. Value = type of the
     /// trailing `do` expression, else `Unit`. The trailing value (if any)
-    /// is also returned as `(name, use_span)` when it is a bare identifier,
-    /// so the caller can apply return-move semantics (SPEC Sec 3).
-    fn check_block(&mut self, b: &Block, bids: &BlockIds) -> (Ity, Option<(String, ByteSpan)>) {
+    /// is also returned as `(name, use_span, use_site)` when it is a bare
+    /// identifier, so the caller can apply return-move semantics (SPEC
+    /// Sec 3). `use_site` is the trailing identifier's [`NodeId`].
+    fn check_block(
+        &mut self,
+        b: &Block,
+        bids: &BlockIds,
+    ) -> (Ity, Option<(String, ByteSpan, NodeId)>) {
         let parent = *self.scope_ids.last().unwrap_or(&ScopeId(0));
         let scope = self.push_scope(parent);
         let mut value = Ity::Unit;
-        let mut trailing: Option<(String, ByteSpan)> = None;
+        let mut trailing: Option<(String, ByteSpan, NodeId)> = None;
         let n = b.stmts.len();
         if n != bids.stmts.len() {
             self.index_mismatch("block statement count differs from index");
@@ -652,7 +686,7 @@ impl<'p> Checker<'p> {
                     // A `let` of a `Str` by bare identifier moves it.
                     if matches!(expr, Expr::Ident(_)) && !self.is_copy(&init_ty) {
                         if let Expr::Ident(nm) = expr {
-                            self.mark_moved(nm, init_span);
+                            self.mark_moved(nm, init_span, expr_ids.node, init_ty.clone());
                         }
                     }
                     // Shadowing re-lets are fresh and legal: overwrite.
@@ -675,8 +709,14 @@ impl<'p> Checker<'p> {
                     if i + 1 == n {
                         value = t;
                         if let Expr::Ident(nm) = e {
-                            trailing = Some((nm.clone(), s));
+                            trailing = Some((nm.clone(), s, expr_ids.node));
                         }
+                    }
+                }
+                (Stmt::Block(b), StmtIds::Block { body: bids, .. }) => {
+                    let (t, _) = self.check_block(b, bids);
+                    if i + 1 == n {
+                        value = t;
                     }
                 }
                 (Stmt::Empty, StmtIds::Empty(_)) => {}
@@ -770,9 +810,19 @@ impl<'p> Checker<'p> {
         // the caller on return. Returning a local owned `Str` transfers it
         // and returning a `Str` parameter moves it; the source binding is
         // marked moved at the trailing use site. `Copy` returns never move.
-        if let Some((nm, use_span)) = trailing {
+        if let Some((nm, use_span, use_site)) = trailing {
             if !self.is_copy(&body_ty) {
-                self.mark_moved(&nm, use_span);
+                // The block scope already popped, so a block-local
+                // trailing value has no live binding to mark (parameters
+                // still do). The use-site moves either way — this is the
+                // historical return-move decision — so record it even
+                // when no binding is marked. Already-moved bindings stay
+                // unrecorded (repeat consumes only diagnose).
+                let live = self.lookup(&nm).is_some();
+                self.mark_moved(&nm, use_span, use_site, body_ty.clone());
+                if !live {
+                    self.move_sites.push((use_site, body_ty.clone()));
+                }
             }
         }
         self.unify(&ret_var, &body_ty);
@@ -821,9 +871,10 @@ pub fn check_with_model(
     if !parse.errors.is_empty() {
         return (Vec::new(), aion_sem_model::SemModel::new());
     }
-    let (diags, tree) = check_clean(parse, file, bytes);
+    let (diags, tree, moved_uses) = check_clean(parse, file, bytes);
     let mut model = aion_sem_model::SemModel::new();
     model.scope_tree = tree;
+    model.moved_uses = moved_uses;
     (diags, model)
 }
 
@@ -831,7 +882,7 @@ fn check_clean(
     parse: &ParseResult,
     file: aion_span::FileId,
     _bytes: &[u8],
-) -> (Vec<Diagnostic>, ScopeTree) {
+) -> (Vec<Diagnostic>, ScopeTree, HashSet<NodeId>) {
     let _ = file;
     let fallback = aion_span::ByteSpan::empty(file, 0);
     // Pre-pass: one fresh variable per parameter and return slot, so
@@ -847,11 +898,12 @@ fn check_clean(
         fn_sigs: HashMap::new(),
         fn_first_span: HashMap::new(),
         move_tys: Vec::new(),
+        move_sites: Vec::new(),
     };
     if parse.program.items.len() != parse.index.items.len() {
         ck.index_mismatch("top-level item count differs from index");
         let diags = ck.diags;
-        return (diags, ck.tree);
+        return (diags, ck.tree, HashSet::new());
     }
     for item in &parse.program.items {
         if let aion_syntax::Item::Fn(f) = item {
@@ -910,6 +962,6 @@ fn check_clean(
     // Post-inference pass: move analysis runs on final resolved types, so
     // late constraints (e.g. a callee pinning a parameter to `Int`) filter
     // out `Copy` false positives; still-unresolved variables stay owned.
-    ck.retain_sound_moves();
-    (ck.diags, ck.tree)
+    let moved_uses = ck.retain_sound_moves();
+    (ck.diags, ck.tree, moved_uses)
 }

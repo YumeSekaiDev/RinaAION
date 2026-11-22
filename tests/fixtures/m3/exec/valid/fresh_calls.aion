@@ -1,0 +1,9 @@
+fn mk() {
+  let s = "hi";
+  do s;
+}
+fn main() {
+  let a = mk();
+  let b = mk();
+  do a == b;
+}

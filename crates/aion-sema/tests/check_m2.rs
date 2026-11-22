@@ -424,6 +424,10 @@ fn collect_ids(pid: &aion_syntax::ProgramIds) -> Vec<NodeId> {
                     out.push(*node);
                     walk_expr(expr, out);
                 }
+                StmtIds::Block { node, body } => {
+                    out.push(*node);
+                    walk_block(body, out);
+                }
                 StmtIds::Goal(n) | StmtIds::Empty(n) => out.push(*n),
                 StmtIds::Assert { node, expr } => {
                     out.push(*node);

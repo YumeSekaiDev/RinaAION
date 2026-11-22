@@ -291,6 +291,7 @@ pub enum Stmt {
         expr: Expr,
     },
     Do(Expr),
+    Block(Block),
     /// Experimental `goal = "...";`
     Goal(String),
     /// Experimental `assert <expr>;`
@@ -441,6 +442,10 @@ pub enum ItemIds {
 #[derive(Debug, Clone)]
 pub struct FnIds {
     pub node: NodeId,
+    /// Declaration header span (`fn` keyword through the `)` closer).
+    /// Used for entry-point diagnostics (SPEC Sec 4: the offending
+    /// `main` declaration span).
+    pub decl: NodeId,
     pub name: NodeId,
     pub params: Vec<NodeId>,
     pub body: BlockIds,
@@ -468,6 +473,10 @@ pub enum StmtIds {
     Do {
         node: NodeId,
         expr: ExprIds,
+    },
+    Block {
+        node: NodeId,
+        body: BlockIds,
     },
     Goal(NodeId),
     Assert {
@@ -507,6 +516,7 @@ pub enum ExprIdsKind {
 enum StmtSub {
     Let { name_id: NodeId, expr_ids: ExprIds },
     Do(ExprIds),
+    Block(BlockIds),
     Assert(ExprIds),
     Bare,
 }
@@ -824,10 +834,13 @@ impl Parser {
         }
         let mut params = Vec::new();
         let mut param_ids = Vec::new();
+        let mut close: Option<ByteSpan> = None;
         loop {
             match self.peek() {
                 Some((TokenKind::Punct, s, _)) if s == ")" => {
+                    let csp = self.toks[self.pos].2;
                     self.bump();
+                    close = Some(csp);
                     break;
                 }
                 Some((TokenKind::Word, _, _)) => {
@@ -894,11 +907,28 @@ impl Parser {
             }
         }
         let (body, body_ids) = self.parse_block();
+        // Declaration header: `fn` keyword through the `)` closer, so
+        // entry-point diagnostics can point at the offending `main`
+        // header. Falls back to the name span (or end of input) when the
+        // closer is missing on a recovery path. Total: never panics.
+        let kw_sp = self.toks.get(start).map(|t| t.2);
+        let end_sp = close.or(name_span).or(kw_sp);
+        let decl_sp = match (kw_sp, end_sp) {
+            (Some(k), Some(e)) => ByteSpan {
+                file: self.file,
+                start: k.start,
+                end: e.end.max(k.start),
+            },
+            (None, Some(e)) => e,
+            (_, None) => ByteSpan::empty(self.file, self.toks.last().map(|t| t.2.end).unwrap_or(0)),
+        };
         let node = self.alloc_cover(start);
+        let decl = self.alloc(decl_sp);
         (
             FnDecl { name, params, body },
             FnIds {
                 node,
+                decl,
                 name: name_id,
                 params: param_ids,
                 body: body_ids,
@@ -991,6 +1021,9 @@ impl Parser {
                     expr: expr_ids,
                 },
             ),
+            (Stmt::Block(b), StmtSub::Block(body)) => {
+                (Stmt::Block(b), StmtIds::Block { node, body })
+            }
             (Stmt::Goal(g), StmtSub::Bare) => (Stmt::Goal(g), StmtIds::Goal(node)),
             (Stmt::Assert(e), StmtSub::Assert(expr_ids)) => (
                 Stmt::Assert(e),
@@ -1005,6 +1038,10 @@ impl Parser {
     }
 
     fn parse_stmt_inner(&mut self) -> Option<(Stmt, StmtSub)> {
+        if self.at_punct("{") {
+            let (b, bids) = self.parse_block();
+            return Some((Stmt::Block(b), StmtSub::Block(bids)));
+        }
         if self.at_punct(";") {
             self.bump();
             return Some((Stmt::Empty, StmtSub::Bare));
@@ -1751,10 +1788,11 @@ fn fmt_block(b: &Block, indent: usize) -> String {
     o
 }
 
-fn fmt_stmt(s: &Stmt, _indent: usize) -> String {
+fn fmt_stmt(s: &Stmt, indent: usize) -> String {
     match s {
         Stmt::Let { name, expr } => format!("let {name} = {};", fmt_expr(expr, 0)),
         Stmt::Do(e) => format!("do {};", fmt_expr(e, 0)),
+        Stmt::Block(b) => fmt_block(b, indent),
         Stmt::Goal(g) => format!("goal = \"{}\";", escape_str(g)),
         Stmt::Assert(e) => format!("assert {};", fmt_expr(e, 0)),
         Stmt::Empty => ";".to_string(),

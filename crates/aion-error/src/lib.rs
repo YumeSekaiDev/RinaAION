@@ -46,8 +46,24 @@ pub enum ErrorCode {
     ArityMismatch = 12,
     /// Duplicate definition.
     DuplicateDefinition = 13,
+    /// Residual type variable at lowering (not lowerable, no IR emitted).
+    UnresolvedType = 14,
     /// Use after move.
     UseAfterMove = 20,
+    /// Internal IR invariant violation (M3.3 validator).
+    InternalIrInvalid = 30,
+    /// Missing / bad entry point (no zero-param `fn main`).
+    EntryPointInvalid = 15,
+    /// Integer division / remainder by zero.
+    DivByZero = 40,
+    /// Integer overflow (incl. `MIN / -1` and negation of `MIN`).
+    IntOverflow = 41,
+    /// Fuel limit exceeded.
+    FuelExhausted = 42,
+    /// Call-frame limit exceeded.
+    StackOverflow = 43,
+    /// Reserved future runtime fault.
+    RuntimeTrap = 44,
 }
 
 impl ErrorCode {
@@ -61,7 +77,15 @@ impl ErrorCode {
             ErrorCode::UnboundName => "AION-E0011",
             ErrorCode::ArityMismatch => "AION-E0012",
             ErrorCode::DuplicateDefinition => "AION-E0013",
+            ErrorCode::UnresolvedType => "AION-E0014",
             ErrorCode::UseAfterMove => "AION-E0020",
+            ErrorCode::InternalIrInvalid => "AION-E0030",
+            ErrorCode::EntryPointInvalid => "AION-E0015",
+            ErrorCode::DivByZero => "AION-E0040",
+            ErrorCode::IntOverflow => "AION-E0041",
+            ErrorCode::FuelExhausted => "AION-E0042",
+            ErrorCode::StackOverflow => "AION-E0043",
+            ErrorCode::RuntimeTrap => "AION-E0044",
         }
     }
 }
@@ -210,7 +234,15 @@ mod tests {
         assert_eq!(ErrorCode::UnboundName.code_str(), "AION-E0011");
         assert_eq!(ErrorCode::ArityMismatch.code_str(), "AION-E0012");
         assert_eq!(ErrorCode::DuplicateDefinition.code_str(), "AION-E0013");
+        assert_eq!(ErrorCode::UnresolvedType.code_str(), "AION-E0014");
         assert_eq!(ErrorCode::UseAfterMove.code_str(), "AION-E0020");
+        assert_eq!(ErrorCode::InternalIrInvalid.code_str(), "AION-E0030");
+        assert_eq!(ErrorCode::EntryPointInvalid.code_str(), "AION-E0015");
+        assert_eq!(ErrorCode::DivByZero.code_str(), "AION-E0040");
+        assert_eq!(ErrorCode::IntOverflow.code_str(), "AION-E0041");
+        assert_eq!(ErrorCode::FuelExhausted.code_str(), "AION-E0042");
+        assert_eq!(ErrorCode::StackOverflow.code_str(), "AION-E0043");
+        assert_eq!(ErrorCode::RuntimeTrap.code_str(), "AION-E0044");
     }
 
     #[test]

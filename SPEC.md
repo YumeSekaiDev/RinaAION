@@ -108,6 +108,90 @@ spanning the identifier.
 - `AION-E0020` UseAfterMove: span = the use site; the earlier move site is
   attached as related.
 
+## Sec 4 — Execution (M3 normative)
+
+M3 executes the M2-checked program. Sema (M2) must be clean before
+execution; any residual M2 diagnostic blocks execution (no IR emitted).
+
+### Entry rule
+
+Execution starts at a zero-parameter `fn main`. A program with no `main`
+function, or whose `main` takes one or more parameters, is `AION-E0015`
+(MissingEntry, span = the offending `main` declaration if present, else
+the end of input). Duplicate `main` definitions stay `AION-E0013`
+(DuplicateDefinition, span = the second definition site).
+
+### Body-value rule
+
+A function body evaluates to the value of its trailing `do` Expr, else
+`Unit` when the body has no trailing `do` Expr. Nested blocks are
+recursive: a nested block statement evaluates the same way (its trailing
+`do` Expr, else `Unit`). `main` discards its body value; the program
+result is always `Unit`.
+
+### Access-authority rule
+
+A move (of a `Str` value) executes iff the M2 move analysis recorded a
+move fact for that use. Exactly four move sites exist:
+
+1. passing a `Str` as a call argument moves it;
+2. binding a `Str` identifier with `let` moves it into the new binding;
+3. returning a local owned `Str` transfers it to the caller;
+4. returning a `Str` parameter moves it.
+
+Any other use of a `Str` is a borrow/read, never a move. The executor
+performs no independent move inference.
+
+### Emission-strictness rule
+
+Lowering to IR requires a fully resolved program: any residual `Var`
+(unresolved type variable after M2 inference) is `AION-E0014`
+(NotLowerable, span = the expression or binding carrying the variable).
+No IR is emitted when `AION-E0014` fires.
+
+### Fuel and frame rules
+
+Each IR expression node costs 1 fuel unit, charged exactly once on first
+evaluation. Defaults: fuel limit 1,000,000 units, call-frame limit 1024
+frames; both are configurable. Exceeding fuel is `AION-E0042`
+(FuelExhausted); exceeding frames is `AION-E0043` (StackOverflow).
+
+### Checked arithmetic and traps
+
+Integer arithmetic is checked: overflow, division by zero, and remainder
+by zero trap (execution aborts with a trap diagnostic at the operator
+span). There is no wrapping, no partial result, and no recovery.
+
+### No-output rule
+
+`do` has no observable effect: it only yields its Expr value to the
+enclosing block. M3 has no `print`, no `emit`, and no host calls; nothing
+in M3 produces output, writes state, or calls out of the program.
+
+### Extended code table
+
+| Code | Name | Meaning |
+| ---- | ---- | ------- |
+| `AION-E0014` | UnresolvedType | residual `Var` at lowering; no IR emitted |
+| `AION-E0015` | EntryPointInvalid | no zero-param `fn main`, or bad signature |
+| `AION-E0030` | InternalIrInvalid | internal IR invariant violation; always a compiler bug, never user error |
+| `AION-E0031`–`AION-E0039` | (reserved) | future internal diagnostics |
+| `AION-E0040` | DivByZero | integer division/remainder by zero |
+| `AION-E0041` | IntOverflow | checked-arithmetic overflow (incl. `MIN / -1`, negation of `MIN`) |
+| `AION-E0042` | FuelExhausted | fuel limit exceeded |
+| `AION-E0043` | StackOverflow | call-frame limit exceeded |
+| `AION-E0044` and above | (reserved) | future runtime traps |
+
+`AION-E0014`/`AION-E0015` are static faults (no execution).
+`AION-E0030`–`AION-E0039` are internal compiler faults (never user error).
+`AION-E0040`+ are runtime traps (faults during execution).
+
+### `null`-as-literal confirmation
+
+The parser is authoritative for the `null` literal: it produces the `Lit`
+node. Sema's keyword-position fallback (Sec 3) is defensive only and must
+agree with the parser; on conflict the parser wins.
+
 ## Appendix A — Grammar (normative)
 
 ```ungram

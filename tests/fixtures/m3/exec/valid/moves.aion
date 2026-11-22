@@ -1,0 +1,8 @@
+fn id(s) {
+  do s;
+}
+fn main() {
+  let a = "hi";
+  let b = id(a);
+  do b;
+}

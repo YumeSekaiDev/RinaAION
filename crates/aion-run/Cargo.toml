@@ -1,0 +1,11 @@
+[package]
+name = "aion-run"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+aion-ir = { path = "../aion-ir" }
+aion-error = { path = "../aion-error" }
+aion-span = { path = "../aion-span" }
+aion-syntax = { path = "../aion-syntax" }
+aion-sem-model = { path = "../aion-sem-model" }

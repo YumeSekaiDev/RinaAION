@@ -1,6 +1,6 @@
 //! Semantic model: queryable data model (no checking logic).
 use aion_span::ByteSpan;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,6 +125,12 @@ pub struct SemModel {
     pub items: Vec<Item>,
     pub scope_tree: ScopeTree,
     pub types: HashMap<aion_syntax::NodeId, Ty>,
+    /// M2-recorded move facts: use-site [`NodeId`]s that moved a value
+    /// (call argument, `let` initializer, or trailing-return position of
+    /// an owned value, after the post-inference soundness filter).
+    /// Single writer is `aion-sema`; `aion-ir` lowering consults this set
+    /// and performs no independent move inference.
+    pub moved_uses: HashSet<aion_syntax::NodeId>,
 }
 
 impl SemModel {
