@@ -1,0 +1,6 @@
+/* leading block */
+fn main() {
+  /* multi
+     line */
+  do 1;
+}

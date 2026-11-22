@@ -1,0 +1,8 @@
+fn outer(a) {
+  let b = a;
+  do b;
+}
+fn main() {
+  let r = outer(1);
+  do r;
+}

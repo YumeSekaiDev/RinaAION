@@ -1,0 +1,13 @@
+fn id(x) {
+  do x;
+}
+fn main() {
+  let a = 1;
+  let b = 2 + 3 * 4;
+  let c = true && false;
+  let d = null;
+  let e = "s";
+  let f = id(a);
+  let g = 1 < 2;
+  do b;
+}

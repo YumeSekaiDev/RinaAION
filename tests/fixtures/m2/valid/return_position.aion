@@ -1,0 +1,10 @@
+fn f() {
+  let x = 1;
+  do x;
+}
+fn g() {
+  let x = 1;
+}
+fn main() {
+  do f();
+}

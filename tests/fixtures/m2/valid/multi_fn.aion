@@ -1,0 +1,10 @@
+fn add(a, b) {
+  do a + b;
+}
+fn neg(x) {
+  do -x;
+}
+fn main() {
+  let s = add(1, 2);
+  do neg(s);
+}

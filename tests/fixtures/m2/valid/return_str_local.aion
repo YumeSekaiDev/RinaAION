@@ -1,0 +1,8 @@
+fn mk() {
+  let s = "hi";
+  do s;
+}
+fn main() {
+  let r = mk();
+  do r;
+}

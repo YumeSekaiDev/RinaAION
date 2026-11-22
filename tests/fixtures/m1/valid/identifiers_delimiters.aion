@@ -1,0 +1,4 @@
+fn main() {
+  let _x1 = 2;
+  do _x1;
+}

@@ -1,0 +1,28 @@
+// DERIVED FILE — do not edit by hand.
+// Source of truth: SPEC.md Appendix A (normative).
+// Sync check: scripts/check_grammar_sync.sh (CI gate: spec-grammar-sync).
+Program = Item*
+Item = FuncDecl
+FuncDecl = 'fn' Ident '(' Params ')' Block
+Params = Ident (',' Ident)*
+Block = '{' Stmt* '}'
+Stmt = LetStmt | DoStmt | Block
+LetStmt = 'let' Ident '=' Expr ';'
+DoStmt = 'do' Expr ';'
+Expr = OrExpr
+OrExpr = AndExpr ('||' AndExpr)*
+AndExpr = CmpExpr ('&&' CmpExpr)*
+CmpExpr = AddExpr (('==' | '!=' | '<' | '<=' | '>' | '>=') AddExpr)*
+AddExpr = MulExpr (('+' | '-') MulExpr)*
+MulExpr = UnaryExpr (('*' | '/' | '%') UnaryExpr)*
+UnaryExpr = ('!' | '-') UnaryExpr | Primary
+Primary = Lit | Ident | Call | '(' Expr ')'
+Call = Ident '(' Args ')'
+Args = Expr (',' Expr)*
+Lit = Int | Str | 'true' | 'false' | 'null'
+Ident = '[A-Za-z_][A-Za-z0-9_]*'
+Int = '[0-9]+'
+Str = '"...' '"'
+GatedIntent = 'intent' Block
+GatedGoal = 'goal' ':' Expr ';'
+GatedAssert = 'assert' Expr ';'

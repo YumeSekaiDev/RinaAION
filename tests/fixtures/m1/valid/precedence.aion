@@ -1,0 +1,6 @@
+fn main() {
+  let b = 1 + 2 * 3 == 7 && true || false;
+  let c = (1 + 2) * 3;
+  do b;
+  do c;
+}

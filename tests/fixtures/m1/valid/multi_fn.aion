@@ -1,0 +1,7 @@
+fn one() {
+  do 1;
+}
+fn two() {
+  let y = 2;
+  do y;
+}

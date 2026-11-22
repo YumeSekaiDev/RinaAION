@@ -1,0 +1,6 @@
+fn id(s) {
+  do s;
+}
+fn main() {
+  do id("x");
+}

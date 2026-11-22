@@ -1,0 +1,11 @@
+fn mk() {
+  do "hi";
+}
+fn eat(s) {
+  do s;
+}
+fn main() {
+  let a = mk();
+  do eat(a);
+  do a;
+}

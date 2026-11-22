@@ -1,0 +1,8 @@
+fn eat(s) {
+  do s;
+}
+fn f(s) {
+  do s == "x";
+  do eat(s);
+  do s;
+}

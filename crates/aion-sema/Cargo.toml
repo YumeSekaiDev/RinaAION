@@ -1,0 +1,10 @@
+[package]
+name = "aion-sema"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+aion-span = { path = "../aion-span" }
+aion-error = { path = "../aion-error" }
+aion-syntax = { path = "../aion-syntax" }
+aion-sem-model = { path = "../aion-sem-model" }

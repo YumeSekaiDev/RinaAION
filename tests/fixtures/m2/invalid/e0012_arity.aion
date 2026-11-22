@@ -1,0 +1,6 @@
+fn f(a, b) {
+  do a;
+}
+fn main() {
+  do f(1);
+}
