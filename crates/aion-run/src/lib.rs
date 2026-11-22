@@ -222,7 +222,12 @@ impl State {
                 Diagnostic::new(ErrorCode::FuelExhausted, "fuel limit exceeded").with_span(e.span),
             );
         }
-        match &e.kind {
+        // M4.1 observer hook: fires only after charge() succeeded, never
+        // charges fuel, never panics, never does I/O. Evaluation continues
+        // identically whether or not the observer is enabled.
+        let _obs_fuel = self.used;
+        let _obs_depth = self.depth as u64;
+        let outcome: Result<Value, Diagnostic> = match &e.kind {
             ExprKind::Int(v) => Ok(Value::Int(*v)),
             ExprKind::Str(s) => Ok(Value::Str(s.clone())),
             ExprKind::Bool(v) => Ok(Value::Bool(*v)),
@@ -291,7 +296,73 @@ impl State {
                 }
                 self.eval_call(callee, vals, e.span, module)
             }
+        };
+        match &outcome {
+            Ok(v) => {
+                Self::observe_expr(e, _obs_depth, _obs_fuel, Some(v));
+            }
+            Err(d) => {
+                Self::observe_expr(e, _obs_depth, _obs_fuel, None);
+                let code = d.code.code_str().to_string();
+                if trace::enabled() {
+                    trace::record_trap(&code, e.span.file.0, e.span.start, e.span.end, _obs_depth);
+                }
+            }
         }
+        outcome
+    }
+
+    /// M4.1 observer record for one expression evaluation. Best-effort:
+    /// any internal failure yields no event, never a panic, never fuel use.
+    fn observe_expr(e: &TypedExpr, depth: u64, fuel_used: u64, val: Option<&Value>) {
+        if !trace::enabled() {
+            return;
+        }
+        let op: &str = match &e.kind {
+            ExprKind::Int(_) => "int",
+            ExprKind::Str(_) => "str",
+            ExprKind::Bool(_) => "bool",
+            ExprKind::Null => "null",
+            ExprKind::Local { access, .. } => match access {
+                LocalAccess::Copy => "local.copy",
+                LocalAccess::Move => "local.move",
+            },
+            ExprKind::Unary { op, .. } => match op {
+                UnOp::Not => "unary.not",
+                UnOp::Neg => "unary.neg",
+            },
+            ExprKind::Binary { op, .. } => match op {
+                BinOp::Or => "binary.or",
+                BinOp::And => "binary.and",
+                BinOp::Eq => "binary.eq",
+                BinOp::Ne => "binary.ne",
+                BinOp::Lt => "binary.lt",
+                BinOp::Le => "binary.le",
+                BinOp::Gt => "binary.gt",
+                BinOp::Ge => "binary.ge",
+                BinOp::Add => "binary.add",
+                BinOp::Sub => "binary.sub",
+                BinOp::Mul => "binary.mul",
+                BinOp::Div => "binary.div",
+                BinOp::Mod => "binary.mod",
+            },
+            ExprKind::Call { .. } => "call",
+        };
+        let ty = e.ty.to_string();
+        let value_json = match val {
+            Some(v) => trace::value_summary(v),
+            None => "{\"type\":\"unknown\"}".to_string(),
+        };
+        let seq = trace::next_seq();
+        trace::record(trace::expr_event(
+            seq,
+            op,
+            &ty,
+            e.span,
+            depth,
+            fuel_used,
+            &value_json,
+        ));
     }
 
     fn eval_unary(&self, op: UnOp, v: Value, span: ByteSpan) -> Result<Value, Diagnostic> {
@@ -399,11 +470,33 @@ impl State {
             );
         }
         self.depth += 1;
+        if trace::enabled() {
+            let seq = trace::next_seq();
+            trace::record(trace::call_event(
+                seq,
+                true,
+                callee,
+                span,
+                self.depth as u64,
+                self.used,
+            ));
+        }
         let mut env = Env::new();
         for ((name, _), v) in f.params.iter().zip(args.into_iter()) {
             env.define(name, v);
         }
         let r = self.eval_block(&f.body, &mut env, module);
+        if trace::enabled() {
+            let seq = trace::next_seq();
+            trace::record(trace::call_event(
+                seq,
+                false,
+                callee,
+                span,
+                self.depth as u64,
+                self.used,
+            ));
+        }
         self.depth -= 1;
         r
     }
@@ -441,6 +534,9 @@ fn internal(e: &TypedExpr, msg: &str) -> Diagnostic {
 }
 
 #[cfg(test)]
+mod m4;
+#[cfg(test)]
 mod oracle;
 #[cfg(test)]
 mod tests;
+mod trace;

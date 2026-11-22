@@ -203,6 +203,72 @@ impl Diagnostic {
     }
 }
 
+impl Diagnostic {
+    /// Canonical per-diagnostic JSON (M4.1): fixed key order
+    /// `severity, code, message, span?, notes?, related?`; absent span and
+    /// empty notes/related are omitted (omit-when-empty). Location fields
+    /// are byte-exact within a variant. UTF-8 output, no trailing newline
+    /// (the envelope adds the LF terminator).
+    pub fn render_canonical_json(&self) -> String {
+        let mut s = format!(
+            "{{\"severity\":\"{}\",\"code\":\"{}\",\"message\":\"{}\"",
+            self.severity,
+            self.code.code_str(),
+            esc(&self.message)
+        );
+        if let Some(sp) = self.span {
+            s.push_str(&format!(
+                ",\"span\":{{\"file\":{},\"start\":{},\"end\":{}}}",
+                sp.file.0, sp.start, sp.end
+            ));
+        }
+        if !self.notes.is_empty() {
+            s.push_str(",\"notes\":[");
+            for (i, n) in self.notes.iter().enumerate() {
+                if i > 0 {
+                    s.push(',');
+                }
+                s.push_str(&format!("\"{}\"", esc(n)));
+            }
+            s.push(']');
+        }
+        if !self.related.is_empty() {
+            s.push_str(",\"related\":[");
+            for (i, (sp, label)) in self.related.iter().enumerate() {
+                if i > 0 {
+                    s.push(',');
+                }
+                s.push_str(&format!(
+                    "{{\"file\":{},\"start\":{},\"end\":{},\"label\":\"{}\"}}",
+                    sp.file.0,
+                    sp.start,
+                    sp.end,
+                    esc(label)
+                ));
+            }
+            s.push(']');
+        }
+        s.push('}');
+        s
+    }
+
+    /// Canonical envelope bytes for a diagnostic list (M4.1): fixed key
+    /// order `schema, version, diagnostics`, UTF-8, single LF terminator.
+    pub fn canonical_envelope_bytes(diags: &[Diagnostic]) -> Vec<u8> {
+        let mut s =
+            String::from("{\"schema\":\"aion.diagnostic/v1\",\"version\":1,\"diagnostics\":[");
+        for (i, d) in diags.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str(&d.render_canonical_json());
+        }
+        s.push_str("]}");
+        s.push('\n');
+        s.into_bytes()
+    }
+}
+
 fn esc(s: &str) -> String {
     let mut o = String::with_capacity(s.len());
     for c in s.chars() {
@@ -218,6 +284,9 @@ fn esc(s: &str) -> String {
     }
     o
 }
+
+#[cfg(test)]
+mod m4_tests;
 
 #[cfg(test)]
 mod tests {

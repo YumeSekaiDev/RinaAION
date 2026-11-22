@@ -1,4 +1,114 @@
-# RINA SPEC (M2)
+# RINA SPEC (M4)
+
+## Sec 5 — M4 normative (intent/goal exposure, assertions, determinism, JSON contract)
+
+M4 is docs-plus-gated-behavior only: Secs 2–4 are unchanged (the
+`GatedGoal = 'goal' ':' Expr ';'` row in Appendix A already records the
+Goal(Expr) adoption; no `goal(Ident)` form exists). All M4 surface
+(intent blocks, goal fields, `assert` statements) is experimental,
+gated, off by default, and rejected with a diagnostic unless explicitly
+enabled. Default-off programs behave exactly as M3.
+
+### Intent/goal exposure (queryable metadata, default-off, non-interference)
+
+- `intent` blocks and `goal` fields are queryable metadata attached to
+  program items, exposed through the entry-point query surface only.
+- Non-interference theorem: for any executable program P and the
+  otherwise identical program P+metadata (same items, statements, and
+  expressions, plus intent/goal metadata), execution results, semantic
+  traces, fuel consumption, and trap identity/payload must be
+  identical between the two variants. Metadata never affects execution.
+  Source spans, line/column positions, and source excerpts are
+  provenance/presentation data: they may differ when metadata changes
+  source layout. Canonical diagnostic comparisons must separate
+  semantic diagnostic fields from source-location fields — never
+  require byte-identical source spans across differently laid-out
+  source variants. Within each individual source variant, source spans
+  remain deterministic. The acceptance test executes both variants and
+  compares results, traces, fuel, and trap identity/payload.
+- Goal form: `Goal(Expr)` — a goal carries a full `Expr`, its source
+  span, and referenced binding ids. Reconciles Appendix A: the grammar
+  row is the Expr form; there is no bare-identifier goal form.
+- Goal checking: name resolution only. Unbound names in a goal yield
+  `AION-E0011` (UnboundName); no type constraints are imposed, no
+  ownership move facts are recorded, and goals contribute nothing to
+  block values, scopes, or moves.
+
+### Assertions
+
+- Static: Bool checking plus literal folding only. No solver. An
+  `assert` operand must type as `Bool`; otherwise the M2 `AION-E0010`
+  (TypeMismatch) rule applies.
+- `TypedStmt::Assert` is its own statement node, never routed via `Do`.
+  It is a 0-cost wrapper: on success it yields nothing (see no-output
+  rule below).
+- Operand fuel: evaluating the operand costs normal per-node fuel (each
+  IR expression node 1 unit, charged once on first evaluation, per
+  Sec 4). The wrapper itself adds no fuel.
+- Literal folding at lowering: literal-`true` asserts are eliminated (no
+  runtime node, no fuel). Literal-`false` asserts become an unconditional
+  `AION-E0044` trap with no operand evaluation.
+- Eligible runtime asserts evaluate their operand; `true` succeeds
+  silently, `false` traps `AION-E0044` (AssertFailed) at the statement
+  span.
+- Assert reads are non-moving reads that produce no ownership move
+  facts: evaluating the operand never moves a `Str`, and no
+  access-authority move fact is recorded for assert-operand reads.
+- Provenance metadata: every assertion carries an origin — one of
+  `human-authored`, `ai-generated`, or `transformed` (the latter
+  preserving the source assertion identity plus the transformation
+  identity, e.g. which lowering pass produced it). Provenance is
+  preserved into diagnostics but grants no authority and changes no
+  rule: all assertions follow identical static and execution rules
+  regardless of origin. Provenance never counts as proof.
+
+### Entry-point query
+
+Execution still starts at zero-parameter `fn main` (Sec 4 entry rule).
+Tooling may query intent/goal metadata anchored at the entry point
+(shape in TDR-M4-3); queries are read-only and never alter execution.
+
+### Determinism
+
+- Canonical trace form and canonical diagnostic form are the normative
+  observable outputs. Determinism gate (M4.1) runs before M4.3/M4.4
+  work: identical input plus configuration yields byte-identical
+  canonical forms — seed independence (no RNG input) and locale
+  independence (no locale-dependent rendering) hold.
+- `Debug` formatting is explicitly unstable and never part of the
+  contract; only the canonical forms are compared.
+
+### JSON contract pointers
+
+- Omit-when-empty is preserved: empty `notes`/`related` fields are
+  omitted (never `null`/empty-list drift) per the established envelope.
+- Versioning convention (policy in TDR-M4-1): every JSON envelope
+  carries `"schema": "aion.<artifact>/v<MAJOR>"` and `"version":
+  <MAJOR>` (integer, starting at 1), e.g. `"schema":
+  "aion.diagnostic/v1", "version": 1`. Within a major version, only
+  additive field additions are allowed; renames, removals, retypings,
+  or semantic changes require a major bump plus a SPEC note.
+  Consumers must reject unknown major versions and must ignore
+  unknown fields (forward compatibility for additive changes).
+- `Debug` output is explicitly unstable and must not be snapshot-tested.
+
+### Extended code table (additions)
+
+| Code | Name | Meaning |
+| ---- | ---- | ------- |
+| `AION-E0044` | AssertFailed | `assert` operand was `false` (statement span); literal-`false` traps unconditionally without operand eval |
+| `AION-E0045` and above | (reserved) | future runtime traps |
+
+`AION-E0044` is a runtime trap (faults during execution), joining the
+`AION-E0040`+ class in Sec 4.
+
+### No-output rule interaction
+
+A successful `assert` yields nothing observable: no value, no output,
+no state write — same class as `do`'s no-observable-effect rule. Only a
+failing assert is observable, as an `AION-E0044` trap diagnostic.
+
+## Appendix A — Grammar (normative)
 
 ## Sec 2 — Syntax (normative)
 
@@ -221,4 +331,7 @@ Str = '"...' '"'
 GatedIntent = 'intent' Block
 GatedGoal = 'goal' ':' Expr ';'
 GatedAssert = 'assert' Expr ';'
+// M4: gated rows are experimental, off by default (no default-behavior
+// change). GatedGoal is the Goal(Expr) form: full Expr + span/ids; no
+// bare-identifier goal form exists.
 ```

@@ -1,0 +1,1 @@
+{"schema":"aion.trace/v1","version":1,"events":[{"seq":0,"kind":"expr","op":"str","ty":"string","span":{"file":0,"start":0,"end":4},"depth":0,"fuel_used":1,"value":{"type":"string","len":2,"hash":"08ba5f07b55ec3da"}}],"truncated":{"truncated":false,"kept":1}}

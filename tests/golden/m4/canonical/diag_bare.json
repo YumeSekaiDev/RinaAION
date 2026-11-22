@@ -1,0 +1,1 @@
+{"schema":"aion.diagnostic/v1","version":1,"diagnostics":[{"severity":"error","code":"AION-E0004","message":"boom"}]}
