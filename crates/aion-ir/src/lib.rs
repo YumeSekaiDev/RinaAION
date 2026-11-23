@@ -154,6 +154,11 @@ pub fn lower(
     source_len: u32,
 ) -> (TypedModule, Vec<Diagnostic>) {
     let fallback = ByteSpan::empty(FileId(0), 0);
+    // Note: first-wins on duplicate fn names iterates scope `symbols`
+    // (a HashMap), but duplicates are unreachable on clean programs —
+    // sema rejects redefinitions before lowering runs — so the winner
+    // is unique and this map is deterministic in practice. Lookups by
+    // key below are order-independent.
     let mut fns: HashMap<String, Ty> = HashMap::new();
     for scope in &model.scope_tree.scopes {
         for sym in scope.symbols.values() {
@@ -175,31 +180,34 @@ pub fn lower(
 
     // E0014 gate first: walk every reachable Ty (model types + every
     // scope-tree symbol type, recursing into nested Fn params/ret).
+    // Determinism: `model.types` and scope `symbols` are HashMaps, so
+    // collect entries in sorted key order and sort the gate by
+    // (span start, span end, message) before emitting diagnostics.
     let mut gate: Vec<(ByteSpan, Ty)> = Vec::new();
-    for ty in model.types.values() {
-        if contains_var(ty) {
-            gate.push((fallback, ty.clone()));
-        }
-    }
-    // Span lookup for model.types entries by NodeId.
-    for (id, ty) in model.types.iter() {
-        if contains_var(ty) {
-            let sp = parse.spans.get(*id).unwrap_or(fallback);
-            if let Some(last) = gate.last_mut() {
-                if last.0 == fallback {
-                    last.0 = sp;
-                }
+    let mut type_ids: Vec<_> = model.types.keys().copied().collect();
+    type_ids.sort_by_key(|id| id.0);
+    for id in type_ids {
+        if let Some(ty) = model.types.get(&id) {
+            if contains_var(ty) {
+                gate.push((parse.spans.get(id).unwrap_or(fallback), ty.clone()));
             }
         }
     }
     for scope in &model.scope_tree.scopes {
-        for sym in scope.symbols.values() {
-            if contains_var(&sym.ty) {
-                gate.push((sym.span, sym.ty.clone()));
+        let mut names: Vec<_> = scope.symbols.keys().collect();
+        names.sort();
+        for name in names {
+            if let Some(sym) = scope.symbols.get(name) {
+                if contains_var(&sym.ty) {
+                    gate.push((sym.span, sym.ty.clone()));
+                }
             }
         }
     }
     if !gate.is_empty() {
+        gate.sort_by(|a, b| {
+            (a.0.start, a.0.end, format!("{}", a.1)).cmp(&(b.0.start, b.0.end, format!("{}", b.1)))
+        });
         for (sp, ty) in gate {
             lx.diags.push(
                 Diagnostic::new(

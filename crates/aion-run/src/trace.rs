@@ -205,3 +205,340 @@ pub(crate) fn call_event(
 pub(crate) fn next_seq() -> u64 {
     OBS.with(|o| o.borrow().kept)
 }
+
+/// Parsed canonical trace envelope (M4.2, test/tooling-side). Events are
+/// kept as raw canonical event objects so a parse → re-emit round-trip
+/// through [`canonical_bytes`] is byte-identical.
+pub struct ParsedTrace {
+    /// Raw canonical event objects, in order.
+    pub events: Vec<String>,
+    /// Truncation flag from the envelope.
+    pub truncated: bool,
+    /// Kept-event count from the envelope.
+    pub kept: u64,
+}
+
+/// Canonical trace envelope reader (M4.2, test/tooling-side).
+///
+/// Accepts bytes produced by [`canonical_bytes`]: UTF-8, single LF
+/// terminator, `schema` `"aion.trace/v1"`. Only major `version` `1` is
+/// accepted (missing or non-`1` rejected); unknown fields are ignored.
+/// Errors are plain strings, never diagnostics.
+pub fn parse_envelope(bytes: &[u8]) -> Result<ParsedTrace, String> {
+    let s = std::str::from_utf8(bytes).map_err(|e| format!("trace envelope is not UTF-8: {e}"))?;
+    let body = s
+        .strip_suffix('\n')
+        .ok_or_else(|| "trace envelope missing LF terminator".to_string())?;
+    if body.contains('\n') || body.contains('\r') {
+        return Err("trace envelope must be a single line".to_string());
+    }
+    let mut p = Cur::new(body);
+    p.expect(b'{')?;
+    let mut schema: Option<String> = None;
+    let mut version: Option<u64> = None;
+    let mut events_raw: Option<String> = None;
+    let mut truncated_raw: Option<String> = None;
+    loop {
+        p.ws();
+        if p.eat(b'}') {
+            break;
+        }
+        let key = p.string()?;
+        p.ws();
+        p.expect(b':')?;
+        p.ws();
+        match key.as_str() {
+            "schema" => schema = Some(p.string()?),
+            "version" => version = Some(p.number()?),
+            "events" => events_raw = Some(p.raw_value()?),
+            "truncated" => truncated_raw = Some(p.raw_value()?),
+            _ => {
+                p.skip_value()?;
+            }
+        }
+        p.ws();
+        if p.eat(b',') {
+            continue;
+        }
+        p.ws();
+        p.expect(b'}')?;
+        break;
+    }
+    match schema.as_deref() {
+        Some("aion.trace/v1") => {}
+        Some(other) => return Err(format!("unsupported trace schema: {other}")),
+        None => return Err("trace envelope missing schema".to_string()),
+    }
+    match version {
+        Some(1) => {}
+        Some(v) => return Err(format!("unsupported major version: {v}")),
+        None => return Err("trace envelope missing version".to_string()),
+    }
+    let events_raw = events_raw.ok_or_else(|| "trace envelope missing events".to_string())?;
+    let truncated_raw =
+        truncated_raw.ok_or_else(|| "trace envelope missing truncated".to_string())?;
+    let events = split_array_raw(&events_raw)?;
+    let (truncated, kept) = parse_truncated(&truncated_raw)?;
+    Ok(ParsedTrace {
+        events,
+        truncated,
+        kept,
+    })
+}
+
+fn split_array_raw(raw: &str) -> Result<Vec<String>, String> {
+    let mut p = Cur::new(raw);
+    p.expect(b'[')?;
+    let mut out = Vec::new();
+    p.ws();
+    if p.eat(b']') {
+        return Ok(out);
+    }
+    loop {
+        p.ws();
+        out.push(p.raw_value()?);
+        p.ws();
+        if p.eat(b',') {
+            continue;
+        }
+        p.ws();
+        p.expect(b']')?;
+        break;
+    }
+    Ok(out)
+}
+
+fn parse_truncated(raw: &str) -> Result<(bool, u64), String> {
+    let mut p = Cur::new(raw);
+    p.expect(b'{')?;
+    let mut truncated: Option<bool> = None;
+    let mut kept: Option<u64> = None;
+    loop {
+        p.ws();
+        if p.eat(b'}') {
+            break;
+        }
+        let key = p.string()?;
+        p.ws();
+        p.expect(b':')?;
+        p.ws();
+        match key.as_str() {
+            "truncated" => {
+                if p.peek("true") {
+                    p.literal("true")?;
+                    truncated = Some(true);
+                } else if p.peek("false") {
+                    p.literal("false")?;
+                    truncated = Some(false);
+                } else {
+                    return Err("truncated flag must be bool".to_string());
+                }
+            }
+            "kept" => kept = Some(p.number()?),
+            _ => {
+                p.skip_value()?;
+            }
+        }
+        p.ws();
+        if p.eat(b',') {
+            continue;
+        }
+        p.ws();
+        p.expect(b'}')?;
+        break;
+    }
+    match (truncated, kept) {
+        (Some(t), Some(k)) => Ok((t, k)),
+        _ => Err("truncated marker missing field".to_string()),
+    }
+}
+
+/// Minimal JSON cursor (byte-indexed; input is UTF-8).
+struct Cur<'a> {
+    b: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Cur<'a> {
+    fn new(s: &'a str) -> Self {
+        Self {
+            b: s.as_bytes(),
+            pos: 0,
+        }
+    }
+    fn ws(&mut self) {
+        while self.pos < self.b.len() && matches!(self.b[self.pos], b' ' | b'\t') {
+            self.pos += 1;
+        }
+    }
+    fn eat(&mut self, c: u8) -> bool {
+        if self.pos < self.b.len() && self.b[self.pos] == c {
+            self.pos += 1;
+            true
+        } else {
+            false
+        }
+    }
+    fn expect(&mut self, c: u8) -> Result<(), String> {
+        if self.eat(c) {
+            Ok(())
+        } else {
+            Err(format!("expected `{}`", c as char))
+        }
+    }
+    fn peek(&self, lit: &str) -> bool {
+        self.b.len() >= self.pos + lit.len()
+            && &self.b[self.pos..self.pos + lit.len()] == lit.as_bytes()
+    }
+    fn literal(&mut self, lit: &str) -> Result<(), String> {
+        if self.peek(lit) {
+            self.pos += lit.len();
+            Ok(())
+        } else {
+            Err(format!("expected `{lit}`"))
+        }
+    }
+    fn number(&mut self) -> Result<u64, String> {
+        let start = self.pos;
+        while self.pos < self.b.len() && self.b[self.pos].is_ascii_digit() {
+            self.pos += 1;
+        }
+        if start == self.pos {
+            return Err("expected number".to_string());
+        }
+        std::str::from_utf8(&self.b[start..self.pos])
+            .map_err(|e| e.to_string())?
+            .parse::<u64>()
+            .map_err(|e| e.to_string())
+    }
+    fn string(&mut self) -> Result<String, String> {
+        self.expect(b'"')?;
+        let mut out = String::new();
+        loop {
+            if self.pos >= self.b.len() {
+                return Err("unterminated string".to_string());
+            }
+            match self.b[self.pos] {
+                b'"' => {
+                    self.pos += 1;
+                    return Ok(out);
+                }
+                b'\\' => {
+                    self.pos += 1;
+                    if self.pos >= self.b.len() {
+                        return Err("unterminated escape".to_string());
+                    }
+                    match self.b[self.pos] {
+                        b'"' => out.push('"'),
+                        b'\\' => out.push('\\'),
+                        b'/' => out.push('/'),
+                        b'n' => out.push('\n'),
+                        b'r' => out.push('\r'),
+                        b't' => out.push('\t'),
+                        b'b' => out.push('\u{0008}'),
+                        b'f' => out.push('\u{000C}'),
+                        b'u' => {
+                            if self.pos + 5 > self.b.len() {
+                                return Err("bad \\u escape".to_string());
+                            }
+                            let hex = std::str::from_utf8(&self.b[self.pos + 1..self.pos + 5])
+                                .map_err(|e| e.to_string())?;
+                            let cp = u32::from_str_radix(hex, 16).map_err(|e| e.to_string())?;
+                            out.push(
+                                char::from_u32(cp).ok_or_else(|| "bad codepoint".to_string())?,
+                            );
+                            self.pos += 4;
+                        }
+                        c => return Err(format!("bad escape `\\{}`", c as char)),
+                    }
+                    self.pos += 1;
+                }
+                _ => {
+                    let ch_len = std::str::from_utf8(&self.b[self.pos..])
+                        .map_err(|e| e.to_string())?
+                        .chars()
+                        .next()
+                        .ok_or_else(|| "unterminated string".to_string())?
+                        .len_utf8();
+                    out.push_str(
+                        std::str::from_utf8(&self.b[self.pos..self.pos + ch_len])
+                            .map_err(|e| e.to_string())?,
+                    );
+                    self.pos += ch_len;
+                }
+            }
+        }
+    }
+    fn raw_value(&mut self) -> Result<String, String> {
+        self.ws();
+        if self.pos >= self.b.len() {
+            return Err("unexpected end".to_string());
+        }
+        match self.b[self.pos] {
+            b'"' => {
+                let start = self.pos;
+                let _ = self.string()?;
+                std::str::from_utf8(&self.b[start..self.pos])
+                    .map(|s| s.to_string())
+                    .map_err(|e| e.to_string())
+            }
+            b'{' | b'[' => {
+                let start = self.pos;
+                let open = self.b[self.pos];
+                let close = if open == b'{' { b'}' } else { b']' };
+                let mut depth = 0usize;
+                let mut in_str = false;
+                let mut esc = false;
+                while self.pos < self.b.len() {
+                    let c = self.b[self.pos];
+                    if in_str {
+                        if esc {
+                            esc = false;
+                        } else if c == b'\\' {
+                            esc = true;
+                        } else if c == b'"' {
+                            in_str = false;
+                        }
+                    } else if c == b'"' {
+                        in_str = true;
+                    } else if c == open {
+                        depth += 1;
+                    } else if c == close {
+                        depth -= 1;
+                        if depth == 0 {
+                            self.pos += 1;
+                            break;
+                        }
+                    }
+                    self.pos += 1;
+                }
+                if depth != 0 {
+                    return Err("unterminated value".to_string());
+                }
+                std::str::from_utf8(&self.b[start..self.pos])
+                    .map(|s| s.to_string())
+                    .map_err(|e| e.to_string())
+            }
+            b't' => {
+                self.literal("true")?;
+                Ok("true".to_string())
+            }
+            b'f' => {
+                self.literal("false")?;
+                Ok("false".to_string())
+            }
+            b'n' => {
+                self.literal("null")?;
+                Ok("null".to_string())
+            }
+            c if c.is_ascii_digit() => {
+                let n = self.number()?;
+                Ok(n.to_string())
+            }
+            _ => Err("unexpected value".to_string()),
+        }
+    }
+    fn skip_value(&mut self) -> Result<(), String> {
+        self.raw_value().map(|_| ())
+    }
+}

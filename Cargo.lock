@@ -38,6 +38,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "aion-query"
+version = "0.0.0"
+dependencies = [
+ "aion-driver",
+ "aion-error",
+ "aion-sem-model",
+ "aion-span",
+ "aion-syntax",
+]
+
+[[package]]
 name = "aion-run"
 version = "0.1.0"
 dependencies = [

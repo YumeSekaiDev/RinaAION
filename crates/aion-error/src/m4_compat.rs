@@ -1,0 +1,65 @@
+//! M4.2 diagnostic serializer + version-checked reader compat tests.
+//! Reader errors are plain strings (never diagnostics); comparisons are on
+//! bytes/strings only, never `Debug` formatting.
+
+use super::{parse_envelope, Diagnostic};
+
+fn round_trip(golden: &[u8], name: &str) {
+    let diags = parse_envelope(golden).unwrap_or_else(|e| panic!("parse {name}: {e}"));
+    let re = Diagnostic::canonical_envelope_bytes(&diags);
+    assert_eq!(re, golden, "round-trip must be byte-identical for {name}");
+}
+
+#[test]
+fn round_trip_canonical_goldens() {
+    round_trip(
+        include_bytes!("../../../tests/golden/m4/canonical/diag_full.json"),
+        "diag_full.json",
+    );
+    round_trip(
+        include_bytes!("../../../tests/golden/m4/canonical/diag_bare.json"),
+        "diag_bare.json",
+    );
+    round_trip(
+        include_bytes!("../../../tests/golden/m4/canonical/diag_related.json"),
+        "diag_related.json",
+    );
+}
+
+#[test]
+fn compat_version2_rejected() {
+    let bytes = include_bytes!("../../../tests/golden/m4/compat/diag_version2.json");
+    let err = parse_envelope(bytes).expect_err("version 2 must be rejected");
+    assert!(err.contains('2'), "error names the version: {err}");
+}
+
+#[test]
+fn compat_missing_version_rejected() {
+    let bytes = include_bytes!("../../../tests/golden/m4/compat/diag_missing_version.json");
+    parse_envelope(bytes).expect_err("missing version must be rejected");
+}
+
+#[test]
+fn compat_unknown_extra_field_accepted() {
+    let bytes = include_bytes!("../../../tests/golden/m4/compat/diag_extra_field.json");
+    let diags = parse_envelope(bytes).expect("unknown fields must be ignored");
+    // Re-emit drops the unknown fields, matching the canonical golden.
+    let canonical = include_bytes!("../../../tests/golden/m4/canonical/diag_full.json");
+    assert_eq!(Diagnostic::canonical_envelope_bytes(&diags), canonical);
+}
+
+#[test]
+fn no_new_error_codes() {
+    // Reader surface uses plain strings only: every failure is Err(String).
+    let bad: &[&[u8]] = &[
+        include_bytes!("../../../tests/golden/m4/compat/diag_version2.json"),
+        include_bytes!("../../../tests/golden/m4/compat/diag_missing_version.json"),
+        b"not json\n",
+        b"\n",
+    ];
+    for b in bad {
+        let e = parse_envelope(b).expect_err("must fail");
+        let s: String = e;
+        assert!(!s.is_empty());
+    }
+}

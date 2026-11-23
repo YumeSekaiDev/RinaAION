@@ -533,8 +533,41 @@ fn internal(e: &TypedExpr, msg: &str) -> Diagnostic {
     .with_span(e.span)
 }
 
+/// Parsed canonical trace envelope (M4.2, test/tooling-side). Events are
+/// raw canonical event objects so a parse → re-emit round-trip through
+/// [`trace_canonical_bytes`] is byte-identical.
+#[derive(Debug, Clone)]
+pub struct ParsedTrace {
+    /// Raw canonical event objects, in order.
+    pub events: Vec<String>,
+    /// Truncation flag from the envelope.
+    pub truncated: bool,
+    /// Kept-event count from the envelope.
+    pub kept: u64,
+}
+
+/// Canonical trace envelope reader (M4.2, test/tooling-side): version-checked
+/// (`aion.trace/v1`, major `1` only), unknown fields ignored, plain `String`
+/// errors (never diagnostics).
+pub fn parse_trace_envelope(bytes: &[u8]) -> Result<ParsedTrace, String> {
+    let p = trace::parse_envelope(bytes)?;
+    Ok(ParsedTrace {
+        events: p.events,
+        truncated: p.truncated,
+        kept: p.kept,
+    })
+}
+
+/// Canonical trace emitter for tooling round-trips: fixed key order, UTF-8,
+/// single LF terminator.
+pub fn trace_canonical_bytes(events: &[String], truncated: bool, kept: u64) -> Vec<u8> {
+    trace::canonical_bytes(events, truncated, kept)
+}
+
 #[cfg(test)]
 mod m4;
+#[cfg(test)]
+mod m4_trace_compat;
 #[cfg(test)]
 mod oracle;
 #[cfg(test)]

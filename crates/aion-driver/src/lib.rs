@@ -28,6 +28,25 @@ pub fn compile(file: aion_span::FileId, bytes: &[u8]) -> aion_syntax::ParseResul
     r
 }
 
+/// M4.2 analysis entry point: single parse, then sema with model iff
+/// parsing is clean. Returns full artifacts on success; diagnostics in
+/// stage order (parse errors first, else sema diags) on failure.
+/// No execution; `compile`/`check`/`run`/`format`/`dump_ir` untouched.
+pub fn analyze(
+    file: aion_span::FileId,
+    bytes: &[u8],
+) -> Result<(aion_syntax::ParseResult, aion_sem_model::SemModel), Vec<aion_error::Diagnostic>> {
+    let parse = aion_syntax::parse(file, bytes);
+    if !parse.errors.is_empty() {
+        return Err(parse.errors);
+    }
+    let (sema_diags, model) = aion_sema::check_with_model(&parse, file, bytes);
+    if !sema_diags.is_empty() {
+        return Err(sema_diags);
+    }
+    Ok((parse, model))
+}
+
 /// M2 semantic check: parse, then typecheck only when parsing is clean.
 pub fn check(file: aion_span::FileId, bytes: &[u8]) -> Vec<aion_error::Diagnostic> {
     let r = aion_syntax::parse(file, bytes);
@@ -100,6 +119,66 @@ pub fn dump_ir(file: aion_span::FileId, bytes: &[u8]) -> String {
         Err(validate_diags) => return render_diags(&validate_diags),
     };
     format!("{module:#?}")
+}
+
+/// M4.2 JSON composition: run the pipeline and render the outcome as a
+/// canonical diagnostic envelope (`aion.diagnostic/v1`, LF-terminated).
+/// `Ok` yields the empty-diagnostics envelope; `Diags`/`Trap` yield the
+/// envelope over the stage diagnostics (trap = single-diagnostic list).
+/// Thin composition only: delegates to [`run`] with a default config, so
+/// execute/run semantics are unchanged and no new pipeline stages exist.
+pub fn run_diagnostics_json(file: aion_span::FileId, bytes: &[u8]) -> String {
+    let diags: Vec<aion_error::Diagnostic> = match run(file, bytes, &Config::default()) {
+        RunOutcome::Ok(_) => Vec::new(),
+        RunOutcome::Diags(ds) => ds,
+        RunOutcome::Trap(d) => vec![d],
+    };
+    String::from_utf8(aion_error::Diagnostic::canonical_envelope_bytes(&diags))
+        .expect("canonical envelope is UTF-8")
+}
+
+/// M4.2 JSON composition: run the pipeline and render the outcome as a
+/// canonical trace envelope (`aion.trace/v1`, LF-terminated) on success.
+/// `Diags` yields the diagnostic envelope over the stage diagnostics;
+/// `Trap` yields the diagnostic envelope over the single trap diagnostic
+/// (traps have no trace to emit).
+///
+/// NOTE: the recording observer (`aion_run`'s `with_observer`) is
+/// crate-private to `aion-run`, so an external driver cannot enable it;
+/// the `Ok` envelope is therefore built with the public canonical emitter
+/// (`aion_run::trace_canonical_bytes`) over the events the public API
+/// exposes (currently none → empty `events`, `kept: 0`, untruncated).
+/// Once `aion-run` exposes a public traced-execute entry point, only this
+/// function's `Ok` arm needs to change; pipeline stages stay identical.
+pub fn run_trace_json(file: aion_span::FileId, bytes: &[u8], config: &aion_run::Config) -> String {
+    // Same stage order as `run` (parse → sema → lower → validate →
+    // execute); no new stages, no semantic drift (single evaluation).
+    let parse = aion_syntax::parse(file, bytes);
+    if !parse.errors.is_empty() {
+        return diag_envelope(&parse.errors);
+    }
+    let (sema_diags, model) = aion_sema::check_with_model(&parse, file, bytes);
+    if !sema_diags.is_empty() {
+        return diag_envelope(&sema_diags);
+    }
+    let (module, lower_diags) = aion_ir::lower(&parse, &model, file, bytes.len() as u32);
+    if !lower_diags.is_empty() {
+        return diag_envelope(&lower_diags);
+    }
+    let module = match aion_ir::validate(&module) {
+        Ok(v) => v,
+        Err(validate_diags) => return diag_envelope(&validate_diags),
+    };
+    match aion_run::execute(&module, config) {
+        RunResult::Ok(_) => String::from_utf8(aion_run::trace_canonical_bytes(&[], false, 0))
+            .expect("canonical trace envelope is UTF-8"),
+        RunResult::Trap(d) => diag_envelope(std::slice::from_ref(&d)),
+    }
+}
+
+fn diag_envelope(diags: &[aion_error::Diagnostic]) -> String {
+    String::from_utf8(aion_error::Diagnostic::canonical_envelope_bytes(diags))
+        .expect("canonical envelope is UTF-8")
 }
 
 fn render_diags(diags: &[aion_error::Diagnostic]) -> String {

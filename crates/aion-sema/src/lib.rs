@@ -101,6 +101,14 @@ struct Checker<'p> {
     /// post-inference soundness filter drops `Copy`-resolved entries;
     /// survivors populate [`aion_sem_model::SemModel::moved_uses`].
     move_sites: Vec<(NodeId, Ity)>,
+    /// Raw (possibly var-containing) type snapshot per expression node,
+    /// plus block-value/stmt node entries. Resolved with the final
+    /// substitution post-inference before publishing on the model.
+    expr_tys: HashMap<NodeId, Ity>,
+    /// Every `(scope, name, type)` ever mirrored into the scope tree, so
+    /// symbol `.ty` fields can be re-resolved post-inference (touching
+    /// only `.ty`, never kind/name/span/moved).
+    mirrored: Vec<(ScopeId, String, Ity)>,
     // Union-find over inference variables; `subst[v]` is the bound
     // ground type (or another `Ity::Var`) when resolved.
     subst: Vec<Option<Ity>>,
@@ -310,6 +318,7 @@ impl<'p> Checker<'p> {
     }
 
     fn mirror(&mut self, scope: ScopeId, name: &str, b: &Bind) {
+        self.mirrored.push((scope, name.to_string(), b.ty.clone()));
         let pub_ty = b.ty.to_pub(self);
         if let Some(s) = self.tree.scopes.get_mut(scope.0 as usize) {
             s.symbols.insert(
@@ -350,6 +359,12 @@ impl<'p> Checker<'p> {
     // -- expressions: returns (type, span) -------------------------------
 
     fn check_expr(&mut self, e: &Expr, ids: &ExprIds) -> (Ity, ByteSpan) {
+        let (ty, sp) = self.check_expr_inner(e, ids);
+        self.expr_tys.insert(ids.node, ty.clone());
+        (ty, sp)
+    }
+
+    fn check_expr_inner(&mut self, e: &Expr, ids: &ExprIds) -> (Ity, ByteSpan) {
         let node_sp = self.span(ids.node);
         match e {
             Expr::Int(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Null => {
@@ -702,10 +717,20 @@ impl<'p> Checker<'p> {
                     };
                     self.current().insert(name.clone(), bind.clone());
                     self.mirror(scope, name, &bind);
+                    if let StmtIds::Let { node, .. } = sid {
+                        self.expr_tys.insert(*node, init_ty.clone());
+                    }
                     let _ = i;
                 }
-                (Stmt::Do(e), StmtIds::Do { expr: expr_ids, .. }) => {
+                (
+                    Stmt::Do(e),
+                    StmtIds::Do {
+                        node,
+                        expr: expr_ids,
+                    },
+                ) => {
                     let (t, s) = self.check_expr(e, expr_ids);
+                    self.expr_tys.insert(*node, t.clone());
                     if i + 1 == n {
                         value = t;
                         if let Expr::Ident(nm) = e {
@@ -713,18 +738,29 @@ impl<'p> Checker<'p> {
                         }
                     }
                 }
-                (Stmt::Block(b), StmtIds::Block { body: bids, .. }) => {
+                (Stmt::Block(b), StmtIds::Block { node, body: bids }) => {
                     let (t, _) = self.check_block(b, bids);
+                    self.expr_tys.insert(*node, t.clone());
                     if i + 1 == n {
                         value = t;
                     }
                 }
-                (Stmt::Empty, StmtIds::Empty(_)) => {}
-                (Stmt::Goal(_), StmtIds::Goal(_)) => {
-                    // Experimental; unreachable with default flags.
+                (Stmt::Empty, StmtIds::Empty(nid)) => {
+                    self.expr_tys.insert(*nid, Ity::Unit);
                 }
-                (Stmt::Assert(e), StmtIds::Assert { expr: expr_ids, .. }) => {
+                (Stmt::Goal(_), StmtIds::Goal(nid)) => {
+                    // Experimental; unreachable with default flags.
+                    self.expr_tys.insert(*nid, Ity::Unit);
+                }
+                (
+                    Stmt::Assert(e),
+                    StmtIds::Assert {
+                        node,
+                        expr: expr_ids,
+                    },
+                ) => {
                     let (t, s) = self.check_expr(e, expr_ids);
+                    self.expr_tys.insert(*node, Ity::Unit);
                     if !matches!(self.resolve(&t), Ity::Error | Ity::Var(_))
                         && self.resolve(&t) != Ity::Bool
                     {
@@ -740,6 +776,7 @@ impl<'p> Checker<'p> {
             }
         }
         let _ = n;
+        self.expr_tys.insert(bids.node, value.clone());
         self.pop_scope();
         (value, trailing)
     }
@@ -859,7 +896,7 @@ pub fn check(parse: &ParseResult, file: aion_span::FileId, bytes: &[u8]) -> Vec<
     if !parse.errors.is_empty() {
         return Vec::new();
     }
-    check_clean(parse, file, bytes).0
+    check_clean(parse, file, bytes).diags
 }
 
 /// Check plus the populated scope tree (visibility for tooling/tests).
@@ -871,18 +908,25 @@ pub fn check_with_model(
     if !parse.errors.is_empty() {
         return (Vec::new(), aion_sem_model::SemModel::new());
     }
-    let (diags, tree, moved_uses) = check_clean(parse, file, bytes);
+    let out = check_clean(parse, file, bytes);
     let mut model = aion_sem_model::SemModel::new();
-    model.scope_tree = tree;
-    model.moved_uses = moved_uses;
-    (diags, model)
+    model.scope_tree = out.tree;
+    model.moved_uses = out.moved_uses;
+    model.items = out.items;
+    model.types = out.types;
+    (out.diags, model)
 }
 
-fn check_clean(
-    parse: &ParseResult,
-    file: aion_span::FileId,
-    _bytes: &[u8],
-) -> (Vec<Diagnostic>, ScopeTree, HashSet<NodeId>) {
+/// Output of [`check_clean`]: diagnostics plus the published model parts.
+struct CleanOutput {
+    diags: Vec<Diagnostic>,
+    tree: ScopeTree,
+    moved_uses: HashSet<NodeId>,
+    items: Vec<aion_sem_model::Item>,
+    types: HashMap<NodeId, PubTy>,
+}
+
+fn check_clean(parse: &ParseResult, file: aion_span::FileId, _bytes: &[u8]) -> CleanOutput {
     let _ = file;
     let fallback = aion_span::ByteSpan::empty(file, 0);
     // Pre-pass: one fresh variable per parameter and return slot, so
@@ -899,11 +943,18 @@ fn check_clean(
         fn_first_span: HashMap::new(),
         move_tys: Vec::new(),
         move_sites: Vec::new(),
+        expr_tys: HashMap::new(),
+        mirrored: Vec::new(),
     };
     if parse.program.items.len() != parse.index.items.len() {
         ck.index_mismatch("top-level item count differs from index");
-        let diags = ck.diags;
-        return (diags, ck.tree, HashSet::new());
+        return CleanOutput {
+            diags: ck.diags,
+            tree: ck.tree,
+            moved_uses: HashSet::new(),
+            items: Vec::new(),
+            types: HashMap::new(),
+        };
     }
     for item in &parse.program.items {
         if let aion_syntax::Item::Fn(f) = item {
@@ -963,5 +1014,41 @@ fn check_clean(
     // late constraints (e.g. a callee pinning a parameter to `Int`) filter
     // out `Copy` false positives; still-unresolved variables stay owned.
     let moved_uses = ck.retain_sound_moves();
-    (ck.diags, ck.tree, moved_uses)
+    // Final resolve pass over all recorded type snapshots with the final
+    // substitution (mirrors the retain_sound_moves resolve_final pattern,
+    // but deep through Fn types via resolve/to_pub) so no grounded-later
+    // Var leaks into the published model.
+    let mut types: HashMap<NodeId, PubTy> = HashMap::with_capacity(ck.expr_tys.len());
+    for (id, raw) in &ck.expr_tys {
+        let resolved = ck.resolve(raw);
+        types.insert(*id, resolved.to_pub(&ck));
+    }
+    // Refresh scope_tree symbol .ty post-inference: re-mirror each recorded
+    // Bind with the final substitution, touching ONLY .ty (kind/name/span
+    // /moved are preserved from the live symbol).
+    for (scope, name, raw) in std::mem::take(&mut ck.mirrored) {
+        let pub_ty = ck.resolve(&raw).to_pub(&ck);
+        if let Some(s) = ck.tree.scopes.get_mut(scope.0 as usize) {
+            if let Some(sym) = s.symbols.get_mut(&name) {
+                sym.ty = pub_ty;
+            }
+        }
+    }
+    // One Item per top-level fn; span is the fn name span.
+    let mut items = Vec::new();
+    for (item, iids) in parse.program.items.iter().zip(parse.index.items.iter()) {
+        if let (aion_syntax::Item::Fn(f), ItemIds::Fn(fids)) = (item, iids) {
+            items.push(aion_sem_model::Item {
+                name: f.name.clone(),
+                span: ck.span(fids.name),
+            });
+        }
+    }
+    CleanOutput {
+        diags: ck.diags,
+        tree: ck.tree,
+        moved_uses,
+        items,
+        types,
+    }
 }

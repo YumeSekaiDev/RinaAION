@@ -1,0 +1,13 @@
+[package]
+name = "aion-query"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+aion-syntax = { path = "../aion-syntax" }
+aion-sem-model = { path = "../aion-sem-model" }
+aion-span = { path = "../aion-span" }
+aion-error = { path = "../aion-error" }
+
+[dev-dependencies]
+aion-driver = { path = "../aion-driver" }

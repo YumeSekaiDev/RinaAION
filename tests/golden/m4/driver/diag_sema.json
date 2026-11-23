@@ -1,0 +1,1 @@
+{"schema":"aion.diagnostic/v1","version":1,"diagnostics":[{"severity":"error","code":"AION-E0020","message":"use of moved value `s`","span":{"file":0,"start":40,"end":41},"related":[{"file":0,"start":34,"end":35,"label":"moved here"}]}]}
