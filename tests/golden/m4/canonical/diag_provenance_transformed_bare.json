@@ -1,0 +1,1 @@
+{"schema":"aion.diagnostic/v1","version":1,"diagnostics":[{"severity":"error","code":"AION-E0010","message":"operand type mismatch","span":{"file":0,"start":19,"end":20},"provenance":{"origin":"transformed"}}]}

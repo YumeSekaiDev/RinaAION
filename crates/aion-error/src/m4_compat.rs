@@ -49,6 +49,26 @@ fn compat_unknown_extra_field_accepted() {
 }
 
 #[test]
+fn compat_provenance_extra_field_accepted() {
+    // T14: unknown fields beside and inside `provenance` are ignored;
+    // re-emit drops them, matching the canonical provenance golden.
+    let bytes = include_bytes!("../../../tests/golden/m4/compat/diag_provenance_extra_field.json");
+    let diags = parse_envelope(bytes).expect("provenance with extras must parse");
+    assert_eq!(diags.len(), 1);
+    assert_eq!(
+        diags[0].provenance,
+        Some(super::AssertProvenance::transformed(
+            Some("s1".to_string()),
+            Some("t9".to_string())
+        )),
+        "provenance preserved, unknowns dropped"
+    );
+    let canonical =
+        include_bytes!("../../../tests/golden/m4/canonical/diag_provenance_transformed.json");
+    assert_eq!(Diagnostic::canonical_envelope_bytes(&diags), canonical);
+}
+
+#[test]
 fn compat_nested_unknown_object_skipped() {
     // T14b: old-reader tolerance covers nested unknown objects (the
     // shape a future `provenance` key would take), not just flat fields.

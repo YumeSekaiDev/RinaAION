@@ -184,6 +184,64 @@ fn envelope_of(diag_json: &str) -> Vec<u8> {
         .into_bytes()
 }
 
+fn assert_provenance_golden(golden: &[u8], name: &str) -> Diagnostic {
+    let back = parse_envelope(golden).unwrap_or_else(|e| panic!("parse {name}: {e}"));
+    assert_eq!(back.len(), 1, "{name}");
+    let re = Diagnostic::canonical_envelope_bytes(&back);
+    assert_eq!(
+        re.as_slice(),
+        golden,
+        "{name}: round-trip must be byte-identical"
+    );
+    back.into_iter().next().unwrap()
+}
+
+#[test]
+fn provenance_canonical_goldens_round_trip() {
+    // T14: reviewed goldens for every non-default origin shape; parse
+    // then re-emit is byte-identical and provenance is preserved.
+    let d = assert_provenance_golden(
+        include_bytes!("../../../tests/golden/m4/canonical/diag_provenance_ai.json"),
+        "diag_provenance_ai.json",
+    );
+    assert_eq!(d.code, ErrorCode::RuntimeTrap);
+    assert_eq!(
+        d.provenance,
+        Some(AssertProvenance::ai_generated(Some("agent-7")))
+    );
+    let d = assert_provenance_golden(
+        include_bytes!("../../../tests/golden/m4/canonical/diag_provenance_ai_bare.json"),
+        "diag_provenance_ai_bare.json",
+    );
+    assert_eq!(
+        d.provenance,
+        Some(AssertProvenance::ai_generated(None::<String>))
+    );
+    let d = assert_provenance_golden(
+        include_bytes!("../../../tests/golden/m4/canonical/diag_provenance_transformed.json"),
+        "diag_provenance_transformed.json",
+    );
+    assert_eq!(d.code, ErrorCode::TypeMismatch);
+    assert_eq!(
+        d.provenance,
+        Some(AssertProvenance::transformed(
+            Some("s1".to_string()),
+            Some("t9".to_string())
+        ))
+    );
+    let d = assert_provenance_golden(
+        include_bytes!("../../../tests/golden/m4/canonical/diag_provenance_transformed_bare.json"),
+        "diag_provenance_transformed_bare.json",
+    );
+    assert_eq!(
+        d.provenance,
+        Some(AssertProvenance::transformed(
+            None::<String>,
+            None::<String>
+        ))
+    );
+}
+
 #[test]
 fn provenance_round_trip_non_default_origins() {
     // T02c/T14d: writer output parses back identically, including

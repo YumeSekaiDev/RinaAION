@@ -1,0 +1,1 @@
+{"schema":"aion.diagnostic/v1","version":1,"diagnostics":[{"severity":"error","code":"AION-E0044","message":"assertion failed","span":{"file":0,"start":12,"end":26},"provenance":{"origin":"ai-generated","identity":"agent-7"}}]}

@@ -1,0 +1,1 @@
+intent "d" { assert true; } fn main() {}

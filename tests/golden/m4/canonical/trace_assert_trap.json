@@ -1,0 +1,1 @@
+{"schema":"aion.trace/v1","version":1,"events":[{"seq":0,"kind":"trap","op":"trap","ty":"trap","span":{"file":0,"start":12,"end":25},"depth":0,"fuel_used":0,"value":{"type":"trap","code":"AION-E0044"}}],"truncated":{"truncated":false,"kept":1}}

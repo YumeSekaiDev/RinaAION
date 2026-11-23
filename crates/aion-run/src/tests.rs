@@ -139,6 +139,84 @@ fn assert_operand_fuel_exhaustion_precedes_e0044() {
     assert_eq!(d.code.code_str(), "AION-E0042");
 }
 
+/// M6a folded-false fixture through parse → lower → validate.
+/// Hand-built scope model (mirrors the oracle harness): types are fully
+/// known, so this exercises the real lowering path for the fixture.
+fn folded_false_fixture_module() -> ValidatedModule {
+    let src = std::fs::read(format!(
+        "{}/../../tests/fixtures/m4_4/trap/assert_folded_false.aion",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .expect("fixture readable");
+    let text = String::from_utf8_lossy(&src).into_owned();
+    let parse = aion_syntax::parse_with_flags(
+        FileId(0),
+        &src,
+        aion_syntax::FeatureFlags::all_experimental(),
+    );
+    assert!(parse.errors.is_empty(), "fixture must parse clean");
+    let mut tree = aion_sem_model::ScopeTree::new();
+    let root = tree.root();
+    assert!(tree.define(
+        root,
+        aion_sem_model::Symbol {
+            kind: aion_sem_model::SymbolKind::Fn,
+            name: "main".to_string(),
+            ty: Ty::Fn {
+                params: vec![],
+                ret: Box::new(Ty::Unit),
+            },
+            span: ByteSpan::empty(FileId(0), 0),
+            moved: false,
+        },
+    ));
+    let model = aion_sem_model::SemModel {
+        items: Vec::new(),
+        scope_tree: tree,
+        types: std::collections::HashMap::new(),
+        moved_uses: std::collections::HashSet::new(),
+        ..Default::default()
+    };
+    let (module, diags) = aion_ir::lower(&parse, &model, FileId(0), text.len() as u32);
+    assert!(diags.is_empty(), "must lower clean");
+    validated(&module)
+}
+
+#[test]
+fn assert_trap_trace_matches_golden_and_is_deterministic() {
+    // T14 + determinism: two runs produce identical bytes, matching
+    // the reviewed golden — a single trap event with the fixture's
+    // assert statement span and no operand evaluation events.
+    let golden =
+        include_bytes!("../../../tests/golden/m4/canonical/trace_assert_trap.json").to_vec();
+    for _ in 0..2 {
+        let validated_m = folded_false_fixture_module();
+        let (r, bytes) = trace::with_observer(|| execute(&validated_m, &Config::default()));
+        assert!(
+            matches!(r, RunResult::Trap(_)),
+            "folded false must trap, got {r:?}"
+        );
+        assert_eq!(
+            bytes.as_slice(),
+            &golden[..],
+            "trace bytes must match the golden"
+        );
+    }
+    let text = String::from_utf8(golden).expect("golden is utf-8");
+    assert!(
+        text.contains("\"code\":\"AION-E0044\""),
+        "trap code pinned: {text}"
+    );
+    assert!(
+        text.contains("\"start\":12") && text.contains("\"end\":25"),
+        "fixture statement span pinned: {text}"
+    );
+    assert!(
+        !text.contains("\"provenance\""),
+        "no provenance in trace events: {text}"
+    );
+}
+
 fn assert_false_block(span: ByteSpan) -> TypedBlock {
     TypedBlock {
         stmts: vec![aion_ir::TypedStmt::AssertFalse {

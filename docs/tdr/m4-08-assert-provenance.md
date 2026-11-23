@@ -84,7 +84,8 @@ assertions) emits no key, so existing canonical bytes are unchanged.
 Serialization normalizes defensively as well: an empty identifier
 string is emitted as absent (never as `""`), without changing the
 origin classification.
-Absent provenance in old artifacts reads as `HumanAuthored`. No
+Absent provenance in old artifacts reads as `None`, distinct
+from `Some(HumanAuthored)`; no provenance is inferred. No
 version bump: the optional object is additive within v1; old readers
 ignore the unknown key via the established skip rule.
 
@@ -106,9 +107,11 @@ In-memory representation: an assertion diagnostic carries
 `Some(origin)` — including `Some(HumanAuthored)` — while an unrelated
 diagnostic carries `None`.
 
-Deserialization: a missing `provenance` key uniformly yields `None`
-(treated as the `HumanAuthored` default); attribution is never
-inferred from `E0044` or `E0010` codes. An unknown `origin` value
+Deserialization: a missing `provenance` key uniformly yields `None`,
+which is distinct from `Some(HumanAuthored)` (`HumanAuthored` is an
+explicit in-memory provenance value, never a fallback for missing
+serialized provenance); attribution is never inferred from `E0044`
+or `E0010` codes. An unknown `origin` value
 fails closed with a reader error. Identifier fields inconsistent with
 the declared origin are dropped on read (mirroring serialization);
 empty identifier strings normalize to absent on read (never emitted
