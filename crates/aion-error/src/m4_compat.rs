@@ -2,7 +2,7 @@
 //! Reader errors are plain strings (never diagnostics); comparisons are on
 //! bytes/strings only, never `Debug` formatting.
 
-use super::{parse_envelope, Diagnostic};
+use super::{parse_envelope, Diagnostic, ErrorCode};
 
 fn round_trip(golden: &[u8], name: &str) {
     let diags = parse_envelope(golden).unwrap_or_else(|e| panic!("parse {name}: {e}"));
@@ -46,6 +46,17 @@ fn compat_unknown_extra_field_accepted() {
     // Re-emit drops the unknown fields, matching the canonical golden.
     let canonical = include_bytes!("../../../tests/golden/m4/canonical/diag_full.json");
     assert_eq!(Diagnostic::canonical_envelope_bytes(&diags), canonical);
+}
+
+#[test]
+fn compat_nested_unknown_object_skipped() {
+    // T14b: old-reader tolerance covers nested unknown objects (the
+    // shape a future `provenance` key would take), not just flat fields.
+    let raw = b"{\"schema\":\"aion.diagnostic/v1\",\"version\":1,\"diagnostics\":[{\"severity\":\"error\",\"code\":\"AION-E0002\",\"message\":\"bad token\",\"x_nested\":{\"a\":[1,{\"b\":null}],\"c\":{}}}]}\n";
+    let diags = parse_envelope(raw).expect("nested unknown fields must be ignored");
+    assert_eq!(diags.len(), 1);
+    assert_eq!(diags[0].code, ErrorCode::UnexpectedToken);
+    assert_eq!(diags[0].provenance, None);
 }
 
 #[test]

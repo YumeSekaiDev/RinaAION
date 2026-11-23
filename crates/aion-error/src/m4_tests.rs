@@ -114,3 +114,202 @@ fn no_rng_time_or_locale_in_canonical_paths() {
         );
     }
 }
+
+#[test]
+fn provenance_omitted_for_default_and_absent() {
+    // T02b: `None` and `HumanAuthored` emit byte-identical output to
+    // the pre-provenance writer (existing goldens pin this).
+    let bare_none = fixture_bare().render_canonical_json();
+    assert!(!bare_none.contains("provenance"));
+    let bare_human = fixture_bare()
+        .with_provenance(AssertProvenance::human_authored())
+        .render_canonical_json();
+    assert_eq!(bare_human, bare_none);
+    let bytes = Diagnostic::canonical_envelope_bytes(&[
+        fixture_full().with_provenance(AssertProvenance::default())
+    ]);
+    let golden = include_bytes!("../../../tests/golden/m4/canonical/diag_full.json");
+    assert_eq!(
+        bytes.as_slice(),
+        &golden[..],
+        "HumanAuthored must not alter canonical bytes"
+    );
+}
+
+#[test]
+fn provenance_object_exact_bytes_and_last_position() {
+    // T02b/T11: exact canonical bytes; the provenance object is the
+    // last field, after `related`.
+    let ai = fixture_bare().with_provenance(AssertProvenance::ai_generated(Some("agent-7")));
+    assert_eq!(
+        ai.render_canonical_json(),
+        "{\"severity\":\"error\",\"code\":\"AION-E0004\",\"message\":\"boom\",\"provenance\":{\"origin\":\"ai-generated\",\"identity\":\"agent-7\"}}"
+    );
+    let ai_bare = fixture_bare().with_provenance(AssertProvenance::ai_generated(None::<String>));
+    assert_eq!(
+        ai_bare.render_canonical_json(),
+        "{\"severity\":\"error\",\"code\":\"AION-E0004\",\"message\":\"boom\",\"provenance\":{\"origin\":\"ai-generated\"}}"
+    );
+    let tx = fixture_related().with_provenance(AssertProvenance::transformed(
+        Some("s1".to_string()),
+        Some("t9".to_string()),
+    ));
+    let j = tx.render_canonical_json();
+    assert_eq!(
+        j,
+        "{\"severity\":\"error\",\"code\":\"AION-E0010\",\"message\":\"mismatch\",\"span\":{\"file\":0,\"start\":0,\"end\":4},\"notes\":[\"n1\"],\"related\":[{\"file\":0,\"start\":1,\"end\":2,\"label\":\"lbl\"}],\"provenance\":{\"origin\":\"transformed\",\"source_ref\":\"s1\",\"transform_id\":\"t9\"}}"
+    );
+    // Empty identifiers normalize to absent on the wire.
+    let tx_empty = fixture_bare().with_provenance(AssertProvenance::transformed(
+        Some(String::new()),
+        Some(String::new()),
+    ));
+    assert_eq!(
+        tx_empty.render_canonical_json(),
+        "{\"severity\":\"error\",\"code\":\"AION-E0004\",\"message\":\"boom\",\"provenance\":{\"origin\":\"transformed\"}}"
+    );
+    // Opaque identifiers are escaped with the shared escaper.
+    let quoted = fixture_bare().with_provenance(AssertProvenance::ai_generated(Some("a\"b\\c")));
+    assert!(
+        quoted
+            .render_canonical_json()
+            .contains("\"identity\":\"a\\\"b\\\\c\""),
+        "identifier escaping: {}",
+        quoted.render_canonical_json()
+    );
+}
+
+fn envelope_of(diag_json: &str) -> Vec<u8> {
+    format!("{{\"schema\":\"aion.diagnostic/v1\",\"version\":1,\"diagnostics\":[{diag_json}]}}\n")
+        .into_bytes()
+}
+
+#[test]
+fn provenance_round_trip_non_default_origins() {
+    // T02c/T14d: writer output parses back identically, including
+    // identifier-bearing and identifier-free variants.
+    for p in [
+        AssertProvenance::ai_generated(Some("agent-7")),
+        AssertProvenance::ai_generated(None::<String>),
+        AssertProvenance::transformed(Some("s1".to_string()), Some("t9".to_string())),
+        AssertProvenance::transformed(None::<String>, None::<String>),
+    ] {
+        let d = fixture_bare().with_provenance(p.clone());
+        let bytes = Diagnostic::canonical_envelope_bytes(&[d]);
+        let back = parse_envelope(&bytes).expect("must parse");
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].code, ErrorCode::ParseError);
+        assert_eq!(back[0].message, "boom");
+        assert_eq!(back[0].provenance, Some(p));
+    }
+}
+
+#[test]
+fn keyless_and_null_provenance_reads_none() {
+    // T12/T14a: old artifacts without the key, and explicit nulls,
+    // both yield None — identically for codes that can carry
+    // provenance (E0010/E0044) and codes that cannot.
+    for code in [
+        ErrorCode::TypeMismatch,
+        ErrorCode::RuntimeTrap,
+        ErrorCode::ParseError,
+    ] {
+        let bytes = Diagnostic::canonical_envelope_bytes(&[Diagnostic::new(code, "m")]);
+        let back = parse_envelope(&bytes).expect("must parse");
+        assert_eq!(back[0].provenance, None, "keyless: {:?}", code.code_str());
+    }
+    let raw = envelope_of(
+        "{\"severity\":\"error\",\"code\":\"AION-E0044\",\"message\":\"m\",\"provenance\":null}",
+    );
+    let back = parse_envelope(&raw).expect("explicit null must parse");
+    assert_eq!(back[0].provenance, None);
+    // Old golden artifacts carry no provenance either.
+    let golden = include_bytes!("../../../tests/golden/m4/canonical/diag_full.json");
+    let back = parse_envelope(golden).expect("golden must parse");
+    assert!(back.iter().all(|d| d.provenance.is_none()));
+}
+
+#[test]
+fn unknown_provenance_origin_fails_closed() {
+    // T12: only the two non-default origins are accepted; anything
+    // else — including a HumanAuthored-shaped origin the writer
+    // never emits — is a reader error.
+    for origin in ["\"human-authored\"", "\"ai\"", "\"\"", "42"] {
+        let raw = envelope_of(&format!(
+            "{{\"severity\":\"error\",\"code\":\"AION-E0010\",\"message\":\"m\",\"provenance\":{{\"origin\":{origin}}}}}"
+        ));
+        assert!(
+            parse_envelope(&raw).is_err(),
+            "origin {origin} must fail closed"
+        );
+    }
+    let raw = envelope_of(
+        "{\"severity\":\"error\",\"code\":\"AION-E0010\",\"message\":\"m\",\"provenance\":{}}",
+    );
+    assert!(parse_envelope(&raw).is_err(), "missing origin must fail");
+}
+
+#[test]
+fn mismatched_provenance_fields_are_dropped() {
+    // T12: identifier fields incompatible with the declared origin
+    // are dropped in both directions; never an error.
+    let raw = envelope_of("{\"severity\":\"error\",\"code\":\"AION-E0010\",\"message\":\"m\",\"provenance\":{\"origin\":\"ai-generated\",\"identity\":\"g\",\"source_ref\":\"s\",\"transform_id\":\"t\"}}");
+    let back = parse_envelope(&raw).expect("must parse");
+    assert_eq!(
+        back[0].provenance,
+        Some(AssertProvenance::ai_generated(Some("g")))
+    );
+    let raw = envelope_of("{\"severity\":\"error\",\"code\":\"AION-E0044\",\"message\":\"m\",\"provenance\":{\"origin\":\"transformed\",\"identity\":\"g\",\"source_ref\":\"s\"}}");
+    let back = parse_envelope(&raw).expect("must parse");
+    assert_eq!(
+        back[0].provenance,
+        Some(AssertProvenance::transformed(
+            Some("s".to_string()),
+            None::<String>
+        ))
+    );
+}
+
+#[test]
+fn empty_identifiers_normalize_to_absent() {
+    // T02c: empty identifier strings read as absent without changing
+    // the declared origin.
+    let raw = envelope_of("{\"severity\":\"error\",\"code\":\"AION-E0010\",\"message\":\"m\",\"provenance\":{\"origin\":\"ai-generated\",\"identity\":\"\"}}");
+    let back = parse_envelope(&raw).expect("must parse");
+    assert_eq!(
+        back[0].provenance,
+        Some(AssertProvenance::ai_generated(None::<String>))
+    );
+    let raw = envelope_of("{\"severity\":\"error\",\"code\":\"AION-E0044\",\"message\":\"m\",\"provenance\":{\"origin\":\"transformed\",\"source_ref\":\"\",\"transform_id\":\"\"}}");
+    let back = parse_envelope(&raw).expect("must parse");
+    assert_eq!(
+        back[0].provenance,
+        Some(AssertProvenance::transformed(
+            None::<String>,
+            None::<String>
+        ))
+    );
+}
+
+#[test]
+fn provenance_unknown_subkeys_skipped_and_code_ignored() {
+    // T12/T14: unknown sub-keys are skipped, and the diagnostic code
+    // plays no role: the same provenance body yields the same value
+    // under assertion and non-assertion codes.
+    let body = "\"provenance\":{\"origin\":\"transformed\",\"source_ref\":\"s\",\"x_future\":{\"nested\":[1,2]},\"zzz\":42}";
+    let mut first = None;
+    for code in ["AION-E0010", "AION-E0044", "AION-E0002"] {
+        let raw = envelope_of(&format!(
+            "{{\"severity\":\"error\",\"code\":\"{code}\",\"message\":\"m\",{body}}}"
+        ));
+        let back = parse_envelope(&raw).expect("must parse");
+        let expected = Some(AssertProvenance::transformed(
+            Some("s".to_string()),
+            None::<String>,
+        ));
+        assert_eq!(back[0].provenance, expected, "code {code}");
+        if let Some(prev) = first.replace(back[0].provenance.clone()) {
+            assert_eq!(prev, back[0].provenance, "code-independent");
+        }
+    }
+}

@@ -393,6 +393,37 @@ impl Diagnostic {
             }
             s.push(']');
         }
+        // M4.4 M5a: optional provenance object, always last.
+        // `HumanAuthored` (and absent provenance) emits no key, so
+        // pre-provenance canonical bytes are unchanged.
+        if let Some(p) = &self.provenance {
+            match p.origin() {
+                AssertOrigin::HumanAuthored => {}
+                AssertOrigin::AiGenerated => {
+                    s.push_str(",\"provenance\":{\"origin\":\"ai-generated\"");
+                    if let Some(g) = p.generator() {
+                        if !g.is_empty() {
+                            s.push_str(&format!(",\"identity\":\"{}\"", esc(g)));
+                        }
+                    }
+                    s.push('}');
+                }
+                AssertOrigin::Transformed => {
+                    s.push_str(",\"provenance\":{\"origin\":\"transformed\"");
+                    if let Some(r) = p.source_ref() {
+                        if !r.is_empty() {
+                            s.push_str(&format!(",\"source_ref\":\"{}\"", esc(r)));
+                        }
+                    }
+                    if let Some(t) = p.transform_id() {
+                        if !t.is_empty() {
+                            s.push_str(&format!(",\"transform_id\":\"{}\"", esc(t)));
+                        }
+                    }
+                    s.push('}');
+                }
+            }
+        }
         s.push('}');
         s
     }
@@ -525,6 +556,8 @@ fn parse_diagnostic(raw: &str) -> Result<Diagnostic, String> {
     let mut notes_raw: Option<String> = None;
     let mut related: Vec<(ByteSpan, String)> = Vec::new();
     let mut related_raw: Option<String> = None;
+    let mut provenance_raw: Option<String> = None;
+    let mut provenance_null = false;
     loop {
         p.ws();
         if p.eat(b'}') {
@@ -548,6 +581,14 @@ fn parse_diagnostic(raw: &str) -> Result<Diagnostic, String> {
             }
             "notes" => notes_raw = Some(p.raw_value()?),
             "related" => related_raw = Some(p.raw_value()?),
+            "provenance" => {
+                if p.peek_is_null() {
+                    p.literal("null")?;
+                    provenance_null = true;
+                } else {
+                    provenance_raw = Some(p.raw_value()?);
+                }
+            }
             _ => {
                 p.skip_value()?;
             }
@@ -601,6 +642,16 @@ fn parse_diagnostic(raw: &str) -> Result<Diagnostic, String> {
     if let Some(r) = related_raw {
         related = parse_related(&r)?;
     }
+    // Keyless or explicit-null provenance reads as `None`; attribution
+    // is never inferred from the diagnostic code.
+    let provenance = if provenance_null {
+        None
+    } else {
+        match provenance_raw {
+            Some(r) => Some(parse_provenance(&r)?),
+            None => None,
+        }
+    };
     Ok(Diagnostic {
         code,
         severity: sev,
@@ -608,9 +659,7 @@ fn parse_diagnostic(raw: &str) -> Result<Diagnostic, String> {
         span,
         notes,
         related,
-        // M0 structural compatibility: keyless diagnostics initialize
-        // provenance to `None`. Provenance wire parsing belongs to M5.
-        provenance: None,
+        provenance,
     })
 }
 
@@ -745,6 +794,64 @@ fn parse_related(raw: &str) -> Result<Vec<(ByteSpan, String)>, String> {
         break;
     }
     Ok(out)
+}
+
+/// Parse a canonical `provenance` object (M4.4 M5b).
+///
+/// `origin` is required: `"ai-generated"` keeps only `identity`,
+/// `"transformed"` keeps only `source_ref`/`transform_id`; anything
+/// else fails closed. Identifier fields incompatible with the declared
+/// origin are dropped, empty identifiers normalize to absent, unknown
+/// keys are skipped, and attribution is never inferred — the caller
+/// supplies no diagnostic code.
+fn parse_provenance(raw: &str) -> Result<AssertProvenance, String> {
+    fn non_empty(s: Option<String>) -> Option<String> {
+        match s {
+            Some(v) if v.is_empty() => None,
+            other => other,
+        }
+    }
+    let mut p = Cur::new(raw);
+    p.expect(b'{')?;
+    let mut origin: Option<String> = None;
+    let mut identity: Option<String> = None;
+    let mut source_ref: Option<String> = None;
+    let mut transform_id: Option<String> = None;
+    loop {
+        p.ws();
+        if p.eat(b'}') {
+            break;
+        }
+        let key = p.string()?;
+        p.ws();
+        p.expect(b':')?;
+        p.ws();
+        match key.as_str() {
+            "origin" => origin = Some(p.string()?),
+            "identity" => identity = Some(p.string()?),
+            "source_ref" => source_ref = Some(p.string()?),
+            "transform_id" => transform_id = Some(p.string()?),
+            _ => {
+                p.skip_value()?;
+            }
+        }
+        p.ws();
+        if p.eat(b',') {
+            continue;
+        }
+        p.ws();
+        p.expect(b'}')?;
+        break;
+    }
+    match origin.as_deref() {
+        Some("ai-generated") => Ok(AssertProvenance::ai_generated(non_empty(identity))),
+        Some("transformed") => Ok(AssertProvenance::transformed(
+            non_empty(source_ref),
+            non_empty(transform_id),
+        )),
+        Some(o) => Err(format!("unknown provenance origin: {o}")),
+        None => Err("provenance missing origin".to_string()),
+    }
 }
 
 /// Minimal JSON cursor over a `&str` (byte-indexed; input is UTF-8).
