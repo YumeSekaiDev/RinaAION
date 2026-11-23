@@ -11,7 +11,7 @@
 //! - items: `fn <ident> ( params? ) <block>`
 //!
 //! Experimental (gated OFF by default):
-//! - `intent "desc" { ... }` item/block, `goal = "...";` field, `assert <expr>;`
+//! - `intent "desc" { ... }` item/block, `goal : <expr>;` field, `assert <expr>;`
 //!   With default flags these produce `AION-E0002` diagnostics and are
 //!   skipped; enable via [`FeatureFlags::all_experimental`].
 //!
@@ -292,8 +292,8 @@ pub enum Stmt {
     },
     Do(Expr),
     Block(Block),
-    /// Experimental `goal = "...";`
-    Goal(String),
+    /// Experimental `goal : <expr>;`
+    Goal(Expr),
     /// Experimental `assert <expr>;`
     Assert(Expr),
     Empty,
@@ -478,7 +478,10 @@ pub enum StmtIds {
         node: NodeId,
         body: BlockIds,
     },
-    Goal(NodeId),
+    Goal {
+        node: NodeId,
+        expr: ExprIds,
+    },
     Assert {
         node: NodeId,
         expr: ExprIds,
@@ -518,6 +521,7 @@ enum StmtSub {
     Do(ExprIds),
     Block(BlockIds),
     Assert(ExprIds),
+    Goal(ExprIds),
     Bare,
 }
 
@@ -1024,7 +1028,13 @@ impl Parser {
             (Stmt::Block(b), StmtSub::Block(body)) => {
                 (Stmt::Block(b), StmtIds::Block { node, body })
             }
-            (Stmt::Goal(g), StmtSub::Bare) => (Stmt::Goal(g), StmtIds::Goal(node)),
+            (Stmt::Goal(e), StmtSub::Goal(expr_ids)) => (
+                Stmt::Goal(e),
+                StmtIds::Goal {
+                    node,
+                    expr: expr_ids,
+                },
+            ),
             (Stmt::Assert(e), StmtSub::Assert(expr_ids)) => (
                 Stmt::Assert(e),
                 StmtIds::Assert {
@@ -1107,43 +1117,22 @@ impl Parser {
                 }
                 return Some((Stmt::Empty, StmtSub::Bare));
             }
-            if !self.expect_punct("=") {
+            if !self.expect_punct(":") {
                 self.recover_to_semi_or_brace();
-                return Some((Stmt::Goal(String::new()), StmtSub::Bare));
-            }
-            let val = match self.peek() {
-                Some((TokenKind::StrLit, _, _)) => {
-                    let s = self.bump().unwrap();
-                    unquote(&s.text)
-                }
-                Some((_, _, sp)) => {
-                    let sp = *sp;
-                    let got = self.toks[self.pos].1.clone();
-                    self.errors.push(
-                        Diagnostic::new(
-                            ErrorCode::UnexpectedToken,
-                            format!("expected string literal, found `{got}`"),
-                        )
-                        .with_span(sp),
-                    );
+                if self.at_punct(";") {
                     self.bump();
-                    String::new()
                 }
-                None => {
-                    self.errors.push(Diagnostic::new(
-                        ErrorCode::UnexpectedEof,
-                        "expected string literal, found end of input",
-                    ));
-                    String::new()
-                }
-            };
+                let expr_ids = self.dummy_ids();
+                return Some((Stmt::Goal(Expr::Int(0)), StmtSub::Goal(expr_ids)));
+            }
+            let (e, e_ids) = self.parse_expr();
             if !self.expect_punct(";") {
                 self.recover_to_semi_or_brace();
                 if self.at_punct(";") {
                     self.bump();
                 }
             }
-            return Some((Stmt::Goal(val), StmtSub::Bare));
+            return Some((Stmt::Goal(e), StmtSub::Goal(e_ids)));
         }
         if self.at_word("assert") {
             let kw = self.bump().unwrap();
@@ -1793,7 +1782,7 @@ fn fmt_stmt(s: &Stmt, indent: usize) -> String {
         Stmt::Let { name, expr } => format!("let {name} = {};", fmt_expr(expr, 0)),
         Stmt::Do(e) => format!("do {};", fmt_expr(e, 0)),
         Stmt::Block(b) => fmt_block(b, indent),
-        Stmt::Goal(g) => format!("goal = \"{}\";", escape_str(g)),
+        Stmt::Goal(e) => format!("goal : {};", fmt_expr(e, 0)),
         Stmt::Assert(e) => format!("assert {};", fmt_expr(e, 0)),
         Stmt::Empty => ";".to_string(),
     }
@@ -1915,5 +1904,138 @@ mod tests {
         let once = r.formatted();
         let twice = format_program(&parse(FileId(0), once.as_bytes()).program);
         assert_eq!(once, twice);
+    }
+
+    fn goal_stmt(r: &ParseResult) -> (&Stmt, &StmtIds) {
+        let items = &r.program.items;
+        assert_eq!(items.len(), 1);
+        let (body, bids) = match &items[0] {
+            Item::Fn(f) => (
+                &f.body,
+                match &r.index.items[0] {
+                    ItemIds::Fn(fid) => &fid.body,
+                    _ => panic!("expected fn ids"),
+                },
+            ),
+            _ => panic!("expected fn item"),
+        };
+        assert_eq!(body.stmts.len(), 1);
+        (&body.stmts[0], &bids.stmts[0])
+    }
+
+    #[test]
+    fn goal_binary_expr_full_ids() {
+        let r = parse_with_flags(
+            FileId(0),
+            b"fn main() { goal : x + 1; }",
+            FeatureFlags::all_experimental(),
+        );
+        assert!(r.errors.is_empty());
+        let (st, sid) = goal_stmt(&r);
+        match st {
+            Stmt::Goal(Expr::Binary { op: BinOp::Add, .. }) => {}
+            other => panic!("expected goal binary, got {other:?}"),
+        }
+        match sid {
+            StmtIds::Goal { expr, .. } => match &expr.kind {
+                ExprIdsKind::Binary { .. } => {}
+                k => panic!("expected binary ids, got {k:?}"),
+            },
+            other => panic!("expected goal ids, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn goal_call_and_nested_expr() {
+        let r = parse_with_flags(
+            FileId(0),
+            b"fn main() { goal : f(x, 1 + 2); }",
+            FeatureFlags::all_experimental(),
+        );
+        assert!(r.errors.is_empty());
+        let (st, sid) = goal_stmt(&r);
+        match st {
+            Stmt::Goal(Expr::Call { callee, args }) => {
+                assert_eq!(callee, "f");
+                assert_eq!(args.len(), 2);
+            }
+            other => panic!("expected goal call, got {other:?}"),
+        }
+        match sid {
+            StmtIds::Goal { expr, .. } => match &expr.kind {
+                ExprIdsKind::Call { args, .. } => assert_eq!(args.len(), 2),
+                k => panic!("expected call ids, got {k:?}"),
+            },
+            other => panic!("expected goal ids, got {other:?}"),
+        }
+        // Nested: goal : (a + b) * c;
+        let r2 = parse_with_flags(
+            FileId(0),
+            b"fn main() { goal : (a + b) * c; }",
+            FeatureFlags::all_experimental(),
+        );
+        assert!(r2.errors.is_empty());
+        let (st2, _) = goal_stmt(&r2);
+        assert!(matches!(st2, Stmt::Goal(Expr::Binary { .. })));
+    }
+
+    #[test]
+    fn goal_bare_ident_valid() {
+        let r = parse_with_flags(
+            FileId(0),
+            b"fn main() { goal : x; }",
+            FeatureFlags::all_experimental(),
+        );
+        assert!(r.errors.is_empty());
+        let (st, sid) = goal_stmt(&r);
+        assert!(matches!(st, Stmt::Goal(Expr::Ident(n)) if n == "x"));
+        assert!(matches!(sid, StmtIds::Goal { .. }));
+    }
+
+    #[test]
+    fn goal_gate_off_yields_empty() {
+        let r = parse(FileId(0), b"fn main() { goal : x; }");
+        assert!(!r.errors.is_empty());
+        assert!(r
+            .errors
+            .iter()
+            .any(|d| d.render_human().contains("AION-E0002")));
+        let items = &r.program.items;
+        match &items[0] {
+            Item::Fn(f) => assert!(matches!(f.body.stmts[0], Stmt::Empty)),
+            _ => panic!("expected fn"),
+        }
+    }
+
+    #[test]
+    fn goal_formatter_round_trip() {
+        let src = "fn main() {\n    goal : x + 1;\n}\n";
+        let r = parse_with_flags(FileId(0), src.as_bytes(), FeatureFlags::all_experimental());
+        assert!(r.errors.is_empty());
+        let once = r.formatted();
+        assert_eq!(once, src);
+        let twice = format_program(
+            &parse_with_flags(FileId(0), once.as_bytes(), FeatureFlags::all_experimental()).program,
+        );
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn goal_old_string_form_rejected() {
+        let r = parse_with_flags(
+            FileId(0),
+            b"fn main() { goal = \"x\"; }",
+            FeatureFlags::all_experimental(),
+        );
+        assert!(!r.errors.is_empty());
+        // Mirrors the `let` malformed path: error + dummy Goal(Int(0)), never clean.
+        let f = match &r.program.items[0] {
+            Item::Fn(f) => f,
+            _ => panic!("expected fn"),
+        };
+        match &f.body.stmts[0] {
+            Stmt::Goal(Expr::Int(0)) => {}
+            other => panic!("expected dummy goal recovery, got {other:?}"),
+        }
     }
 }

@@ -197,7 +197,7 @@ fn m1_experimental_enabled_with_flags() {
     let flags = FeatureFlags::all_experimental();
     let r = parse_with_flags(FileId(0), b"intent \"ship\" { }", flags);
     assert!(r.errors.is_empty(), "{:?}", r.errors);
-    let r = parse_with_flags(FileId(0), b"fn main() { goal = \"x\"; assert y; }", flags);
+    let r = parse_with_flags(FileId(0), b"fn main() { goal : x; assert y; }", flags);
     assert!(r.errors.is_empty(), "{:?}", r.errors);
     // Round-trip works for experimental items too when enabled.
     let once = r.formatted();

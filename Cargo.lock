@@ -12,6 +12,7 @@ version = "0.0.0"
 dependencies = [
  "aion-error",
  "aion-ir",
+ "aion-query",
  "aion-run",
  "aion-sem-model",
  "aion-sema",

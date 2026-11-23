@@ -131,6 +131,40 @@ pub struct SemModel {
     /// Single writer is `aion-sema`; `aion-ir` lowering consults this set
     /// and performs no independent move inference.
     pub moved_uses: HashSet<aion_syntax::NodeId>,
+    /// M4 intent/goal metadata (resolution only; never affects execution).
+    pub intents: Vec<IntentEntry>,
+    /// Owner [`NodeId`] -> indices into [`SemModel::intents`].
+    pub intents_by_owner: HashMap<aion_syntax::NodeId, Vec<usize>>,
+    /// Indices into [`SemModel::intents`] with `owner: None` (orphans).
+    pub orphans: Vec<usize>,
+}
+
+/// One name occurrence inside a goal expression: the use-site [`NodeId`]
+/// plus the declaration [`NodeId`] it resolved to (`None` when unbound).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GoalRef {
+    pub use_site: aion_syntax::NodeId,
+    pub decl: Option<aion_syntax::NodeId>,
+}
+
+/// One `goal : <expr>;` statement: its statement [`NodeId`], its
+/// expression index, and every name occurrence resolved within it.
+#[derive(Debug, Clone)]
+pub struct GoalEntry {
+    pub stmt: aion_syntax::NodeId,
+    pub expr: aion_syntax::ExprIds,
+    pub refs: Vec<GoalRef>,
+}
+
+/// One explicit top-level `intent` block attached to its owning `fn`
+/// item (R-FOLLOWING; `owner: None` marks a retained orphan), carrying
+/// only that block's goals — or one synthesized entry per `fn` with
+/// body goals (`intent: None`), carrying only the body goals.
+#[derive(Debug, Clone)]
+pub struct IntentEntry {
+    pub owner: Option<aion_syntax::NodeId>,
+    pub intent: Option<aion_syntax::NodeId>,
+    pub goals: Vec<GoalEntry>,
 }
 
 impl SemModel {

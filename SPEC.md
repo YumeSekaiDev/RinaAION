@@ -11,8 +11,36 @@ enabled. Default-off programs behave exactly as M3.
 
 ### Intent/goal exposure (queryable metadata, default-off, non-interference)
 
-- `intent` blocks and `goal` fields are queryable metadata attached to
-  program items, exposed through the entry-point query surface only.
+- `intent` blocks and goal statements are queryable metadata attached
+  to program items, exposed through the entry-point query surface only.
+- Ownership: each top-level `intent` block is owned by the nearest
+  following `fn` item in source order (R-FOLLOWING). An `intent` block
+  with no following `fn` is an *orphan*: it is retained in the
+  semantic model but excluded from entry-point queries and from the
+  normal intent envelope. Multiple `intent` blocks under one item
+  accumulate independently, in source order; no merging.
+  Synthesized entries: for each function, if its body contains one
+  or more body goals, create exactly one synthesized entry containing
+  those goals, regardless of whether the function also has explicit
+  intent entries. A synthesized entry has no
+  intent block: its description is empty (and omitted from JSON) and
+  it carries no intent-block span. Explicit intent entries hold only
+  their own block-body goals. Synthesized entries are created only
+  when body goals exist, are owned by their function like any other
+  entry, and are never orphans.
+  Ordering: every entry is anchored at a source span — explicit
+  entries at their intent-block span, synthesized entries at the span
+  of their first body goal in source order. Entries sort ascending by
+  anchor `(file, start, end)`; goals within each entry remain in
+  source order.
+- Entry scope: entry-anchored queries return intents owned by `fn
+  main` (zero-parameter) and by its transitively reachable callees.
+  Analysis entry: `analyze()` keeps its default-flags behavior
+  unchanged; `analyze_with_flags(file, bytes, flags)` composes
+  `parse_with_flags()` with `check_with_model()` for enabled
+  analysis. Both share the M4.2 success/failure contract.
+  Unreachable-item intents and orphans are retained in the model but
+  invisible to entry queries.
 - Non-interference theorem: for any executable program P and the
   otherwise identical program P+metadata (same items, statements, and
   expressions, plus intent/goal metadata), execution results, semantic
@@ -25,14 +53,22 @@ enabled. Default-off programs behave exactly as M3.
   require byte-identical source spans across differently laid-out
   source variants. Within each individual source variant, source spans
   remain deterministic. The acceptance test executes both variants and
-  compares results, traces, fuel, and trap identity/payload.
-- Goal form: `Goal(Expr)` — a goal carries a full `Expr`, its source
-  span, and referenced binding ids. Reconciles Appendix A: the grammar
-  row is the Expr form; there is no bare-identifier goal form.
-- Goal checking: name resolution only. Unbound names in a goal yield
-  `AION-E0011` (UnboundName); no type constraints are imposed, no
-  ownership move facts are recorded, and goals contribute nothing to
-  block values, scopes, or moves.
+  compares results, fuel, and trap identity/payload; cross-path trace
+  equivalence is deferred until AION has a traced-execution interface
+  (the public trace serializer output is covered by its golden test).
+- Goal form: `goal : Expr ;` (`Goal(Expr)`) — a goal carries a full `Expr`, its source span and referenced binding ids. A goal whose expression happens
+  to be a single identifier (e.g. `goal : x ;`) is a valid `Goal(Expr)`
+  and serializes as `{"kind":"ident","name":"x"}`; there is no
+  separate identifier-only production.
+- Goal checking: name resolution only. Goals resolve in their owning
+  function's lexical environment; orphan-block goals resolve in the
+  top-level environment only and are never attributed to a function.
+  Unbound names yield `AION-E0011` (UnboundName) at the identifier
+  span; E0011 from goals is blocking: a program with an unbound goal
+  name fails semantic checking and is not executed, like any other M2
+  diagnostic. No type constraints are imposed, no ownership move facts
+  are recorded, and goals contribute nothing to block values, scopes,
+  or moves.
 
 ### Assertions
 
@@ -67,6 +103,66 @@ enabled. Default-off programs behave exactly as M3.
 Execution still starts at zero-parameter `fn main` (Sec 4 entry rule).
 Tooling may query intent/goal metadata anchored at the entry point
 (shape in TDR-M4-3); queries are read-only and never alter execution.
+
+### `aion.intent/v1` envelope
+
+- Schema `"aion.intent/v1"`, `"version": 1`. Key order: `schema`,
+  `version`, `entry`, `intents`. Omit-when-empty is preserved
+  throughout; the envelope is LF-terminated; canonical bytes are the
+  contract and `Debug` output is never contractual. Readers reject
+  unknown major versions and ignore unknown fields (policy in
+  TDR-M4-1); within major version 1 only additive field additions are
+  allowed.
+- `entry`: `{"name": "main"}` when the zero-parameter entry point
+  resolves; omitted when there is no entry point. A missing entry
+  yields an empty envelope, never an error; `AION-E0015` remains the
+  execution path's concern.
+- `intents`: array in source order, entry scope only (orphan blocks
+  and unreachable-item intents never appear). Each entry:
+  `{"owner": {"item": "<fn-name>", "span": {file,start,end}},
+  "span": {file,start,end}, "desc": "...", "goals": [...]}`.
+  `owner.span` is the whole-item span; `span` is the intent block's
+  span; all spans are complete `{file,start,end}` objects and are
+  never synthesized (missing span means the field is omitted).
+  `desc` is the parser-provided optional description, `""` when
+  absent, and is omitted from JSON when empty. The Appendix A
+  `GatedIntent` row does not record the description slot; that gap is
+  logged as a specification issue and is out of M4.3 scope.
+- `goals`: array in source order per intent. Each goal:
+  `{"goal_ast": <expr>, "goal_span": {file,start,end}, "refs": [...]}`.
+  `goal_ast` is the closed 8-kind vocabulary below; no other node
+  kinds exist.
+- Expression vocabulary (frozen at M4.3; mirrors the AST field names —
+  struct variants reuse their field names, tuple variants gain one
+  key):
+
+  | AST | JSON | Fields |
+  | --- | ---- | ------ |
+  | `Int(i64)` | `{"kind":"int","value":N}` | `value`: JSON number, full i64 range |
+  | `Str(String)` | `{"kind":"str","value":S}` | `value`: the AST's unquoted content as a JSON string |
+  | `Bool(bool)` | `{"kind":"bool","value":B}` | `value`: JSON `true`/`false` |
+  | `Null` | `{"kind":"null"}` | no other fields |
+  | `Ident(String)` | `{"kind":"ident","name":S}` | `name`: the identifier text |
+  | `Unary{op,rhs}` | `{"kind":"unary","op":O,"rhs":E}` | `op`: `"-"` (`Neg`) or `"!"` (`Not`); `rhs`: goal-expr, recursed |
+  | `Binary{op,lhs,rhs}` | `{"kind":"binary","op":O,"lhs":E,"rhs":E}` | `op`: one of `"||","&&","==","!=","<","<=",">",">=","+","-","*","/","%"`; `lhs`/`rhs`: goal-exprs, recursed |
+  | `Call{callee,args}` | `{"kind":"call","callee":S,"args":[...]}` | `callee`: bare name string (the AST has no callee expression); `args`: array of goal-exprs, possibly empty |
+
+  Parenthesised source yields the identical node (parens are
+  precedence-only); nesting recurses with this same table.
+- `refs`: one entry per identifier occurrence in the goal, sorted by
+  occurrence span. `refs` covers every resolved-or-unbound name
+  occurrence in the goal expression, including call callees
+  (occurrence = callee identifier span); argument expressions recurse
+  normally. Bound:
+  `{"name","status":"bound","occurrence":{file,start,end},
+  "decl":{"name","span":{file,start,end}}}`. Unresolved:
+  `{"name","status":"unresolved","occurrence":{...},"decl":null,
+  "diagnostic":"AION-E0011"}`. `decl` names the declaration and its
+  name span, which distinguishes shadowed declarations sharing a
+  name. No type information appears (name-resolution-only rule). Raw
+  `NodeId`s never appear anywhere in the envelope.
+- Freeze note: this vocabulary and field list are frozen at M4.3 and
+  recorded here before any golden tests are written.
 
 ### Determinism
 
@@ -332,6 +428,7 @@ GatedIntent = 'intent' Block
 GatedGoal = 'goal' ':' Expr ';'
 GatedAssert = 'assert' Expr ';'
 // M4: gated rows are experimental, off by default (no default-behavior
-// change). GatedGoal is the Goal(Expr) form: full Expr + span/ids; no
-// bare-identifier goal form exists.
+// change). GatedGoal is the Goal(Expr) form: full Expr + span/ids; there
+// is no separate identifier-only production (a goal whose Expr is a
+// single Ident is a valid Goal(Expr)).
 ```

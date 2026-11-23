@@ -10,3 +10,4 @@ aion-sem-model = { path = "../aion-sem-model" }
 aion-ir = { path = "../aion-ir" }
 aion-sema = { path = "../aion-sema" }
 aion-run = { path = "../aion-run" }
+aion-query = { path = "../aion-query" }

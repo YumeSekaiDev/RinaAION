@@ -47,6 +47,48 @@ pub fn analyze(
     Ok((parse, model))
 }
 
+/// M4.3 enabled analysis: `parse_with_flags()` composed with
+/// `check_with_model()`. Same `Ok`/`Err` contract as [`analyze`];
+/// [`analyze`] behavior is unchanged.
+pub fn analyze_with_flags(
+    file: aion_span::FileId,
+    bytes: &[u8],
+    flags: aion_syntax::FeatureFlags,
+) -> Result<(aion_syntax::ParseResult, aion_sem_model::SemModel), Vec<aion_error::Diagnostic>> {
+    let parse = aion_syntax::parse_with_flags(file, bytes, flags);
+    if !parse.errors.is_empty() {
+        return Err(parse.errors);
+    }
+    let (sema_diags, model) = aion_sema::check_with_model(&parse, file, bytes);
+    if !sema_diags.is_empty() {
+        return Err(sema_diags);
+    }
+    Ok((parse, model))
+}
+
+/// M4.3 intent envelope routing: default-flags parse, then sema with
+/// model. Parse errors yield the diagnostic envelope; any sema
+/// diagnostic yields the diagnostic envelope; otherwise the entry
+/// intent envelope (entry omitted when there is no entry point).
+pub fn run_intent_json(file: aion_span::FileId, bytes: &[u8]) -> String {
+    let parse = aion_syntax::parse(file, bytes);
+    if !parse.errors.is_empty() {
+        return diag_envelope(&parse.errors);
+    }
+    let (sema_diags, model) = aion_sema::check_with_model(&parse, file, bytes);
+    if !sema_diags.is_empty() {
+        return diag_envelope(&sema_diags);
+    }
+    let view = aion_query::view(&parse, &model);
+    let intents = view.entry_intents();
+    let entry = view.entry_point().ok().map(|h| h.name);
+    String::from_utf8(aion_query::intent_canonical_bytes(
+        entry.as_deref(),
+        &intents,
+    ))
+    .expect("intent envelope is UTF-8")
+}
+
 /// M2 semantic check: parse, then typecheck only when parsing is clean.
 pub fn check(file: aion_span::FileId, bytes: &[u8]) -> Vec<aion_error::Diagnostic> {
     let r = aion_syntax::parse(file, bytes);

@@ -39,7 +39,7 @@ fn collect_block(ids: &aion_syntax::BlockIds, exprs: &mut Vec<NodeId>) {
             StmtIds::Do { expr, .. } => collect_expr_nodes(expr, exprs),
             StmtIds::Block { body, .. } => collect_block(body, exprs),
             StmtIds::Assert { expr, .. } => collect_expr_nodes(expr, exprs),
-            StmtIds::Goal(_) | StmtIds::Empty(_) => {}
+            StmtIds::Goal { .. } | StmtIds::Empty(_) => {}
         }
     }
 }

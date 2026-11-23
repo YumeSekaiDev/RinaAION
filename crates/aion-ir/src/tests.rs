@@ -55,7 +55,7 @@ fn collect_block(b: &BlockIds, out: &mut Vec<NodeId>) {
                 out.push(*node);
                 collect_block(body, out);
             }
-            StmtIds::Goal(id) => out.push(*id),
+            StmtIds::Goal { node: id, .. } => out.push(*id),
             StmtIds::Assert { node, expr } => {
                 out.push(*node);
                 collect_expr(expr, out);

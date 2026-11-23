@@ -12,7 +12,9 @@
 //! never searches source text.
 
 use aion_error::{Diagnostic, ErrorCode};
-use aion_sem_model::{ScopeId, ScopeTree, Symbol, SymbolKind, Ty as PubTy};
+use aion_sem_model::{
+    GoalEntry, GoalRef, IntentEntry, ScopeId, ScopeTree, Symbol, SymbolKind, Ty as PubTy,
+};
 use aion_span::ByteSpan;
 use aion_syntax::{
     Block, BlockIds, Expr, ExprIds, ExprIdsKind, FnIds, ItemIds, NodeId, ParseResult, Stmt, StmtIds,
@@ -73,6 +75,7 @@ struct Bind {
     ty: Ity,
     kind: SymbolKind,
     def_span: ByteSpan,
+    decl: NodeId,
     moved: bool,
     move_span: Option<ByteSpan>,
 }
@@ -114,6 +117,16 @@ struct Checker<'p> {
     subst: Vec<Option<Ity>>,
     fn_sigs: HashMap<String, FnSig>,
     fn_first_span: HashMap<String, ByteSpan>,
+    /// Goals collected from the function body currently being checked
+    /// (resolution only; drained by `check_clean` per `fn` item).
+    cur_fn_goals: Vec<GoalEntry>,
+    /// Retired (popped) scopes: scope id -> bindings snapshot. Purely
+    /// additive retention so owned intent-block goals can resolve in
+    /// their owner fn's lexical environment after the body is checked.
+    /// Never consulted by normal checking paths.
+    retired: HashMap<ScopeId, HashMap<String, Bind>>,
+    /// Block node -> scope id for every block entered during checking.
+    block_scopes: HashMap<NodeId, ScopeId>,
 }
 
 impl<'p> Checker<'p> {
@@ -300,6 +313,34 @@ impl<'p> Checker<'p> {
         None
     }
 
+    /// Resolve `name` starting from an arbitrary scope id, walking the
+    /// scope tree innermost-first. Consults retired (popped) scope
+    /// snapshots first, falling back to still-live scopes. Used only
+    /// for owned intent-goal resolution; normal checking uses
+    /// [`Self::lookup`].
+    fn lookup_at(&self, mut scope: ScopeId, name: &str) -> Option<Bind> {
+        loop {
+            if let Some(m) = self.retired.get(&scope) {
+                if let Some(b) = m.get(name) {
+                    return Some(b.clone());
+                }
+            } else if let Some(pos) = self.scope_ids.iter().position(|&s| s == scope) {
+                if let Some(b) = self.bindings.get(pos).and_then(|m| m.get(name)) {
+                    return Some(b.clone());
+                }
+            }
+            match self
+                .tree
+                .scopes
+                .get(scope.0 as usize)
+                .and_then(|s| s.parent)
+            {
+                Some(parent) => scope = parent,
+                None => return None,
+            }
+        }
+    }
+
     fn current(&mut self) -> &mut HashMap<String, Bind> {
         let n = self.bindings.len().saturating_sub(1);
         &mut self.bindings[n]
@@ -313,8 +354,11 @@ impl<'p> Checker<'p> {
     }
 
     fn pop_scope(&mut self) {
-        self.scope_ids.pop();
-        self.bindings.pop();
+        // Retain the popped bindings snapshot (keyed by scope id) for
+        // owned intent-goal resolution; normal checking never reads it.
+        if let (Some(id), Some(map)) = (self.scope_ids.pop(), self.bindings.pop()) {
+            self.retired.insert(id, map);
+        }
     }
 
     fn mirror(&mut self, scope: ScopeId, name: &str, b: &Bind) {
@@ -667,6 +711,95 @@ impl<'p> Checker<'p> {
         );
     }
 
+    /// Resolution-only goal check: walk `e`/`ids` in parallel, resolving
+    /// every name occurrence (including call callees) with [`Self::lookup`]
+    /// against the live scopes. Unbound names yield `E0011` at the
+    /// occurrence span. Records `(occurrence, decl)` per occurrence.
+    /// No inference, no moves, no scope changes.
+    /// Resolution-only goal check. With `base: None`, resolves against
+    /// the live scopes (function-body goals). With `base: Some(scope)`,
+    /// resolves against that scope id through live + retired scopes
+    /// (owned intent-block goals resolve in their owner fn's lexical
+    /// environment, including parameters and body locals).
+    fn check_goal(
+        &mut self,
+        e: &Expr,
+        ids: &ExprIds,
+        refs: &mut Vec<GoalRef>,
+        base: Option<ScopeId>,
+    ) {
+        // Single resolution point: live stack for body goals, scope-id
+        // walk (live + retired snapshots) for owned intent goals.
+        let resolve = |ck: &Self, name: &str| -> Option<Bind> {
+            match base {
+                None => ck.lookup(name).map(|(_, b)| b),
+                Some(scope) => ck.lookup_at(scope, name),
+            }
+        };
+        match e {
+            Expr::Ident(name) => {
+                if name == "null" {
+                    return; // `null` reads as the Null literal
+                }
+                let sp = self.span(ids.node);
+                match resolve(self, name) {
+                    None => {
+                        self.diags.push(
+                            Diagnostic::new(
+                                ErrorCode::UnboundName,
+                                format!("unbound name `{name}`"),
+                            )
+                            .with_span(sp),
+                        );
+                        refs.push(GoalRef {
+                            use_site: ids.node,
+                            decl: None,
+                        });
+                    }
+                    Some(b) => refs.push(GoalRef {
+                        use_site: ids.node,
+                        decl: Some(b.decl),
+                    }),
+                }
+            }
+            Expr::Call { callee, args } => {
+                let (callee_id, _, arg_ids) = Self::call_parts(ids);
+                let csp = self.span(callee_id);
+                match resolve(self, callee) {
+                    None => {
+                        self.diags.push(
+                            Diagnostic::new(
+                                ErrorCode::UnboundName,
+                                format!("unbound name `{callee}`"),
+                            )
+                            .with_span(csp),
+                        );
+                        refs.push(GoalRef {
+                            use_site: callee_id,
+                            decl: None,
+                        });
+                    }
+                    Some(b) => refs.push(GoalRef {
+                        use_site: callee_id,
+                        decl: Some(b.decl),
+                    }),
+                }
+                for (a, a_ids) in args.iter().zip(arg_ids.iter()) {
+                    self.check_goal(a, a_ids, refs, base);
+                }
+            }
+            Expr::Unary { rhs, .. } => {
+                self.check_goal(rhs, Self::unary_rhs(ids), refs, base);
+            }
+            Expr::Binary { lhs, rhs, .. } => {
+                let (l_ids, r_ids) = Self::binary_parts(ids);
+                self.check_goal(lhs, l_ids, refs, base);
+                self.check_goal(rhs, r_ids, refs, base);
+            }
+            _ => {}
+        }
+    }
+
     /// Check a block in a fresh child scope. Value = type of the
     /// trailing `do` expression, else `Unit`. The trailing value (if any)
     /// is also returned as `(name, use_span, use_site)` when it is a bare
@@ -679,6 +812,7 @@ impl<'p> Checker<'p> {
     ) -> (Ity, Option<(String, ByteSpan, NodeId)>) {
         let parent = *self.scope_ids.last().unwrap_or(&ScopeId(0));
         let scope = self.push_scope(parent);
+        self.block_scopes.insert(bids.node, scope);
         let mut value = Ity::Unit;
         let mut trailing: Option<(String, ByteSpan, NodeId)> = None;
         let n = b.stmts.len();
@@ -712,6 +846,7 @@ impl<'p> Checker<'p> {
                         ty: v,
                         kind: SymbolKind::Let,
                         def_span,
+                        decl: *name_id,
                         moved: false,
                         move_span: None,
                     };
@@ -748,9 +883,26 @@ impl<'p> Checker<'p> {
                 (Stmt::Empty, StmtIds::Empty(nid)) => {
                     self.expr_tys.insert(*nid, Ity::Unit);
                 }
-                (Stmt::Goal(_), StmtIds::Goal(nid)) => {
-                    // Experimental; unreachable with default flags.
-                    self.expr_tys.insert(*nid, Ity::Unit);
+                (
+                    Stmt::Goal(e),
+                    StmtIds::Goal {
+                        node,
+                        expr: expr_ids,
+                    },
+                ) => {
+                    // Resolution only: no unify/bind_var/fresh_var, no
+                    // mark_moved, no define/mirror/push/pop, no
+                    // block-value contribution; the statement keeps
+                    // `Unit` type. Called with the enclosing block
+                    // scope live.
+                    let mut refs = Vec::new();
+                    self.check_goal(e, expr_ids, &mut refs, None);
+                    self.cur_fn_goals.push(GoalEntry {
+                        stmt: *node,
+                        expr: expr_ids.clone(),
+                        refs,
+                    });
+                    self.expr_tys.insert(*node, Ity::Unit);
                 }
                 (
                     Stmt::Assert(e),
@@ -782,6 +934,8 @@ impl<'p> Checker<'p> {
     }
 
     fn check_fn(&mut self, f: &aion_syntax::FnDecl, fids: &FnIds, global: ScopeId) {
+        // Fresh per-function goal buffer; drained by `check_clean`.
+        self.cur_fn_goals = Vec::new();
         // Duplicate definitions still get their bodies checked (in a
         // fresh scope) so one error does not hide others.
         let name_span = self.span(fids.name);
@@ -835,6 +989,7 @@ impl<'p> Checker<'p> {
                 ty,
                 kind: SymbolKind::Param,
                 def_span: pspan,
+                decl: *pid,
                 moved: false,
                 move_span: None,
             };
@@ -873,6 +1028,7 @@ impl<'p> Checker<'p> {
                 ty: fty.clone(),
                 kind: SymbolKind::Fn,
                 def_span: name_span,
+                decl: fids.name,
                 moved: false,
                 move_span: None,
             };
@@ -914,16 +1070,82 @@ pub fn check_with_model(
     model.moved_uses = out.moved_uses;
     model.items = out.items;
     model.types = out.types;
+    let mut intents_by_owner: HashMap<NodeId, Vec<usize>> = HashMap::new();
+    let mut orphans: Vec<usize> = Vec::new();
+    for (i, e) in out.intents.iter().enumerate() {
+        match e.owner {
+            Some(o) => intents_by_owner.entry(o).or_default().push(i),
+            None => orphans.push(i),
+        }
+    }
+    model.intents = out.intents;
+    model.intents_by_owner = intents_by_owner;
+    model.orphans = orphans;
     (out.diags, model)
 }
 
 /// Output of [`check_clean`]: diagnostics plus the published model parts.
+/// Anchor sort key for an intent entry: the intent node span for
+/// explicit entries, the first body-goal stmt span for synthesized
+/// entries. `None` (no anchor) sorts after every `Some` key, so
+/// anchorless entries land deterministically last. Pure query over the
+/// parse spans; never panics, never fabricates.
+fn anchor_key(e: &IntentEntry, ck: &Checker) -> Option<(u32, u32, u32)> {
+    let sp = match e.intent {
+        Some(n) => ck.span(n),
+        None => {
+            let g = e.goals.first()?;
+            ck.span(g.stmt)
+        }
+    };
+    Some((sp.file.0, sp.start, sp.end))
+}
+
+/// Collect `goal : <expr>;` statements from an intent body at any
+/// nesting depth. Non-goal statements contribute nothing.
+fn collect_intent_goals(
+    ck: &mut Checker,
+    b: &aion_syntax::Block,
+    bids: &BlockIds,
+    out: &mut Vec<GoalEntry>,
+    base: Option<ScopeId>,
+) {
+    if b.stmts.len() != bids.stmts.len() {
+        ck.index_mismatch("intent block statement count differs from index");
+        return;
+    }
+    for (st, sid) in b.stmts.iter().zip(bids.stmts.iter()) {
+        match (st, sid) {
+            (
+                Stmt::Goal(e),
+                StmtIds::Goal {
+                    node,
+                    expr: expr_ids,
+                },
+            ) => {
+                let mut refs = Vec::new();
+                ck.check_goal(e, expr_ids, &mut refs, base);
+                out.push(GoalEntry {
+                    stmt: *node,
+                    expr: expr_ids.clone(),
+                    refs,
+                });
+            }
+            (Stmt::Block(inner), StmtIds::Block { body, .. }) => {
+                collect_intent_goals(ck, inner, body, out, base);
+            }
+            _ => {}
+        }
+    }
+}
+
 struct CleanOutput {
     diags: Vec<Diagnostic>,
     tree: ScopeTree,
     moved_uses: HashSet<NodeId>,
     items: Vec<aion_sem_model::Item>,
     types: HashMap<NodeId, PubTy>,
+    intents: Vec<IntentEntry>,
 }
 
 fn check_clean(parse: &ParseResult, file: aion_span::FileId, _bytes: &[u8]) -> CleanOutput {
@@ -945,6 +1167,9 @@ fn check_clean(parse: &ParseResult, file: aion_span::FileId, _bytes: &[u8]) -> C
         move_sites: Vec::new(),
         expr_tys: HashMap::new(),
         mirrored: Vec::new(),
+        cur_fn_goals: Vec::new(),
+        retired: HashMap::new(),
+        block_scopes: HashMap::new(),
     };
     if parse.program.items.len() != parse.index.items.len() {
         ck.index_mismatch("top-level item count differs from index");
@@ -954,6 +1179,7 @@ fn check_clean(parse: &ParseResult, file: aion_span::FileId, _bytes: &[u8]) -> C
             moved_uses: HashSet::new(),
             items: Vec::new(),
             types: HashMap::new(),
+            intents: Vec::new(),
         };
     }
     for item in &parse.program.items {
@@ -977,8 +1203,8 @@ fn check_clean(parse: &ParseResult, file: aion_span::FileId, _bytes: &[u8]) -> C
     ck.bindings.push(HashMap::new());
     // Publish every function name up front so calls resolve regardless
     // of definition order (forward references included).
-    for item in &parse.program.items {
-        if let aion_syntax::Item::Fn(f) = item {
+    for (item, iids) in parse.program.items.iter().zip(parse.index.items.iter()) {
+        if let (aion_syntax::Item::Fn(f), ItemIds::Fn(fids)) = (item, iids) {
             if let Some(sig) = ck.fn_sigs.get(&f.name).cloned() {
                 let fty = Ity::Fn {
                     params: sig.param_vars,
@@ -987,11 +1213,8 @@ fn check_clean(parse: &ParseResult, file: aion_span::FileId, _bytes: &[u8]) -> C
                 let b = Bind {
                     ty: fty,
                     kind: SymbolKind::Fn,
-                    def_span: ByteSpan {
-                        file,
-                        start: 0,
-                        end: 0,
-                    },
+                    def_span: ck.span(fids.name),
+                    decl: fids.name,
                     moved: false,
                     move_span: None,
                 };
@@ -999,17 +1222,68 @@ fn check_clean(parse: &ParseResult, file: aion_span::FileId, _bytes: &[u8]) -> C
             }
         }
     }
+    // Pending intent blocks: (intent node, intent body + index). Each is
+    // claimed by the nearest following `fn` (R-FOLLOWING); leftovers
+    // become retained orphans. Bodies resolve only at claim time, in the
+    // owner fn's lexical environment (top-level for orphans).
+    let mut pending: Vec<(NodeId, aion_syntax::Block, BlockIds)> = Vec::new();
+    let mut intents: Vec<IntentEntry> = Vec::new();
     for (item, iids) in parse.program.items.iter().zip(parse.index.items.iter()) {
         match (item, iids) {
-            (aion_syntax::Item::Fn(f), ItemIds::Fn(fids)) => ck.check_fn(f, fids, global),
-            (aion_syntax::Item::Intent(_), ItemIds::Intent(_)) => {
-                // Experimental; unreachable with default flags.
+            (aion_syntax::Item::Fn(f), ItemIds::Fn(fids)) => {
+                ck.check_fn(f, fids, global);
+                let fn_goals = std::mem::take(&mut ck.cur_fn_goals);
+                // Owner environment: the fn body block scope recorded
+                // during checking (params + body locals via retired
+                // snapshots). Falls back to live scopes only if the body
+                // was never entered (already-diagnosed index mismatch).
+                let env = ck.block_scopes.get(&fids.body.node).copied();
+                for (intent_node, ibody, ibids) in pending.drain(..) {
+                    let mut igoals = Vec::new();
+                    collect_intent_goals(&mut ck, &ibody, &ibids, &mut igoals, env);
+                    intents.push(IntentEntry {
+                        owner: Some(fids.node),
+                        intent: Some(intent_node),
+                        goals: igoals,
+                    });
+                }
+                if !fn_goals.is_empty() {
+                    intents.push(IntentEntry {
+                        owner: Some(fids.node),
+                        intent: None,
+                        goals: fn_goals,
+                    });
+                }
+            }
+            (aion_syntax::Item::Intent(b), ItemIds::Intent(ii)) => {
+                // Deferred: resolved at claim time in the owner fn's
+                // environment, or here in the top-level environment if
+                // the block is orphaned (no following `fn`).
+                pending.push((ii.node, b.body.clone(), ii.body.clone()));
             }
             _ => {
                 ck.index_mismatch("item/index kind mismatch");
             }
         }
     }
+    for (intent_node, ibody, ibids) in pending.drain(..) {
+        // Orphan-position resolution: only the top-level scope is live
+        // here, so orphan goals resolve in the top-level environment.
+        let mut goals = Vec::new();
+        collect_intent_goals(&mut ck, &ibody, &ibids, &mut goals, None);
+        intents.push(IntentEntry {
+            owner: None,
+            intent: Some(intent_node),
+            goals,
+        });
+    }
+    // Anchor ordering: sort by anchor span (file, start, end). Anchor is
+    // the intent node span for explicit entries, the first body-goal
+    // stmt span for synthesized entries; sort key only, never stored.
+    // The key is explicit `Option`: entries without an anchor sort
+    // deterministically last (`None` sorts after `Some`). No spans are
+    // fabricated and nothing here can panic.
+    intents.sort_by_key(|a| anchor_key(a, &ck));
     // Post-inference pass: move analysis runs on final resolved types, so
     // late constraints (e.g. a callee pinning a parameter to `Int`) filter
     // out `Copy` false positives; still-unresolved variables stay owned.
@@ -1050,5 +1324,6 @@ fn check_clean(parse: &ParseResult, file: aion_span::FileId, _bytes: &[u8]) -> C
         moved_uses,
         items,
         types,
+        intents,
     }
 }

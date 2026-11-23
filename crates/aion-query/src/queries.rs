@@ -22,6 +22,14 @@ pub fn view<'a>(parse: &'a ParseResult, model: &'a SemModel) -> SemanticView<'a>
     SemanticView { parse, model }
 }
 
+impl<'a> SemanticView<'a> {
+    /// Read-only access to the borrowed parse + model for crate-internal
+    /// intent views. Not part of the public query surface.
+    pub(crate) fn parse_and_model(&self) -> (&'a ParseResult, &'a SemModel) {
+        (self.parse, self.model)
+    }
+}
+
 /// Plain query failure; deliberately free of diagnostic codes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueryError {

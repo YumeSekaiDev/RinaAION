@@ -1,0 +1,2 @@
+fn helper(a) { do a + 1; }
+fn main() { do helper(1); }

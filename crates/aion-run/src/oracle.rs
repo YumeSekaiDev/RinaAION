@@ -530,7 +530,7 @@ fn block_ids(b: &BlockIds, out: &mut Vec<aion_syntax::NodeId>) {
                 out.push(*node);
                 block_ids(body, out);
             }
-            StmtIds::Goal(n) => out.push(*n),
+            StmtIds::Goal { node: n, .. } => out.push(*n),
             StmtIds::Assert { node, expr } => {
                 out.push(*node);
                 expr_ids(expr, out);
@@ -633,6 +633,7 @@ mod harness {
             scope_tree: tree,
             types: HashMap::new(),
             moved_uses: HashSet::new(),
+            ..Default::default()
         }
     }
 

@@ -5,9 +5,13 @@
 //! move derivation of its own.
 
 pub mod calls;
+pub mod intent_json;
+pub mod intents;
 pub mod queries;
 pub mod scope;
 
 pub use calls::CallGraph;
+pub use intent_json::{intent_canonical_bytes, parse_intent_envelope, ParsedIntent};
+pub use intents::{GoalRefView, GoalView, IntentView};
 pub use queries::{view, FnHandle, FnSig, MoveSite, QueryError, ResolvedTy, SemanticView};
 pub use scope::{ScopeInfo, SymbolInfo};

@@ -68,6 +68,7 @@ fn model_for(sigs: &[Sig<'_>]) -> aion_sem_model::SemModel {
         scope_tree: tree,
         types: HashMap::new(),
         moved_uses: HashSet::new(),
+        ..Default::default()
     }
 }
 
