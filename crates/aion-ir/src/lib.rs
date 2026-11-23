@@ -19,7 +19,7 @@
 //! or adversarial hand-off) yield `AION-E0004` diagnostics; any residual
 //! type variable yields `AION-E0014` and no IR is emitted.
 
-use aion_error::{Diagnostic, ErrorCode};
+use aion_error::{AssertProvenance, Diagnostic, ErrorCode};
 use aion_sem_model::Ty;
 use aion_span::{ByteSpan, FileId};
 use aion_syntax::{
@@ -91,6 +91,21 @@ pub enum TypedStmt {
     },
     Block {
         body: TypedBlock,
+    },
+    /// Distinct assertion node (M4.4): never routed via `Do`.
+    /// `span` is the original assertion statement span; `provenance`
+    /// is the assertion's provenance for diagnostic attribution.
+    Assert {
+        expr: TypedExpr,
+        span: ByteSpan,
+        provenance: AssertProvenance,
+    },
+    /// Folded `assert false` (M4.4 M3): unconditional `E0044` trap.
+    /// No operand to evaluate and no fuel to consult; carries the
+    /// original statement span and provenance.
+    AssertFalse {
+        span: ByteSpan,
+        provenance: AssertProvenance,
     },
     Empty,
 }
@@ -388,8 +403,20 @@ impl Lower<'_> {
         let n = b.stmts.len();
         let mut stmts = Vec::with_capacity(n);
         let mut value = Ty::Unit;
+        // M4.4 M3: eliminated `assert true` statements do not exist for
+        // trailing-value purposes; the block value is determined by the
+        // last surviving statement, as if eliminated nodes were absent.
+        let last_live = b.stmts.iter().rposition(|st| {
+            !matches!(
+                st,
+                Stmt::Assert {
+                    expr: Expr::Bool(true),
+                    ..
+                }
+            )
+        });
         for (i, (st, sid)) in b.stmts.iter().zip(bids.stmts.iter()).enumerate() {
-            let trailing = i + 1 == n;
+            let trailing = Some(i) == last_live;
             match (st, sid) {
                 (
                     Stmt::Let { name, expr },
@@ -435,11 +462,39 @@ impl Lower<'_> {
                 (Stmt::Empty, StmtIds::Empty(_)) => {
                     stmts.push(TypedStmt::Empty);
                 }
-                (Stmt::Assert(e), StmtIds::Assert { expr: expr_ids, .. }) => {
-                    // Experimental; unreachable on clean parses. Lower the
-                    // expression for shape, discard its value.
-                    let te = self.lower_expr(e, expr_ids);
-                    stmts.push(TypedStmt::Do { expr: te });
+                (
+                    Stmt::Assert {
+                        expr: e,
+                        provenance,
+                    },
+                    StmtIds::Assert {
+                        node,
+                        expr: expr_ids,
+                    },
+                ) => {
+                    let span = self.span(*node);
+                    // M4.4 M3 literal-only folding: bare literals only.
+                    // Anything else keeps dynamic operand-first behavior.
+                    match e {
+                        Expr::Bool(true) => {
+                            // Eliminated completely: no node, no fuel,
+                            // no diagnostic or trap.
+                        }
+                        Expr::Bool(false) => {
+                            stmts.push(TypedStmt::AssertFalse {
+                                span,
+                                provenance: provenance.clone(),
+                            });
+                        }
+                        _ => {
+                            let te = self.lower_expr(e, expr_ids);
+                            stmts.push(TypedStmt::Assert {
+                                expr: te,
+                                span,
+                                provenance: provenance.clone(),
+                            });
+                        }
+                    }
                 }
                 _ => {
                     let fb = self.fallback;

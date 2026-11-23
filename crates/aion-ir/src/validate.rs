@@ -257,6 +257,18 @@ impl<'a> Checker<'a> {
                     trailing_ty = Some((expr.ty.clone(), expr.span));
                     trailing_is_do = i + 1 == stmts.len();
                 }
+                TypedStmt::Assert { expr, .. } => {
+                    // Assertions contribute no block value.
+                    self.check_expr(expr);
+                    trailing_ty = None;
+                    trailing_is_do = false;
+                }
+                TypedStmt::AssertFalse { .. } => {
+                    // Folded false carries no operand; nothing to check
+                    // and no block value.
+                    trailing_ty = None;
+                    trailing_is_do = false;
+                }
                 TypedStmt::Block { body } => {
                     self.check_block(body, false, None);
                     trailing_ty = None;
@@ -495,6 +507,8 @@ fn last_span(b: &TypedBlock) -> Option<ByteSpan> {
     for st in b.stmts.iter().rev() {
         match st {
             TypedStmt::Do { expr } => return Some(expr.span),
+            TypedStmt::Assert { span, .. } => return Some(*span),
+            TypedStmt::AssertFalse { span, .. } => return Some(*span),
             TypedStmt::Let { init, .. } => return Some(init.span),
             TypedStmt::Block { body } => {
                 if let Some(sp) = last_span(body) {

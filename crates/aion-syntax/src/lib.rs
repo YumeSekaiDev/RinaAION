@@ -19,7 +19,7 @@
 //! arbitrary bytes); invalid bytes yield `TokenKind::Error` +
 //! `AION-E0001` diagnostics.
 
-use aion_error::{Diagnostic, ErrorCode};
+use aion_error::{AssertProvenance, Diagnostic, ErrorCode};
 use aion_span::{ByteSpan, FileId};
 use std::collections::HashMap;
 use std::fmt;
@@ -294,9 +294,28 @@ pub enum Stmt {
     Block(Block),
     /// Experimental `goal : <expr>;`
     Goal(Expr),
-    /// Experimental `assert <expr>;`
-    Assert(Expr),
+    /// Experimental `assert <expr>;` (provenance is metadata only and
+    /// never appears in source formatting).
+    Assert {
+        expr: Expr,
+        provenance: AssertProvenance,
+    },
     Empty,
+}
+
+impl Stmt {
+    /// Plain source assertion: defaults to `HumanAuthored` provenance.
+    pub fn assert(expr: Expr) -> Self {
+        Stmt::Assert {
+            expr,
+            provenance: AssertProvenance::human_authored(),
+        }
+    }
+
+    /// Assertion with explicit provenance for trusted tooling.
+    pub fn assert_with_provenance(expr: Expr, provenance: AssertProvenance) -> Self {
+        Stmt::Assert { expr, provenance }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1035,8 +1054,8 @@ impl Parser {
                     expr: expr_ids,
                 },
             ),
-            (Stmt::Assert(e), StmtSub::Assert(expr_ids)) => (
-                Stmt::Assert(e),
+            (Stmt::Assert { expr: e, .. }, StmtSub::Assert(expr_ids)) => (
+                Stmt::assert(e),
                 StmtIds::Assert {
                     node,
                     expr: expr_ids,
@@ -1157,7 +1176,7 @@ impl Parser {
                     self.bump();
                 }
             }
-            return Some((Stmt::Assert(e), StmtSub::Assert(e_ids)));
+            return Some((Stmt::assert(e), StmtSub::Assert(e_ids)));
         }
         if self.at_punct("}") {
             // Let parse_block handle it; shouldn't happen here.
@@ -1783,7 +1802,7 @@ fn fmt_stmt(s: &Stmt, indent: usize) -> String {
         Stmt::Do(e) => format!("do {};", fmt_expr(e, 0)),
         Stmt::Block(b) => fmt_block(b, indent),
         Stmt::Goal(e) => format!("goal : {};", fmt_expr(e, 0)),
-        Stmt::Assert(e) => format!("assert {};", fmt_expr(e, 0)),
+        Stmt::Assert { expr: e, .. } => format!("assert {};", fmt_expr(e, 0)),
         Stmt::Empty => ";".to_string(),
     }
 }
@@ -1874,6 +1893,77 @@ mod tests {
             .errors
             .iter()
             .any(|d| d.render_human().contains("AION-E0001")));
+    }
+
+    #[test]
+    fn assert_parses_with_human_authored_provenance() {
+        let flags = FeatureFlags {
+            intent: false,
+            goal: false,
+            assert_stmt: true,
+        };
+        let r = parse_with_flags(FileId(0), b"fn main() { assert true; }", flags);
+        assert!(
+            r.errors.is_empty(),
+            "parse errors: {:?}",
+            r.errors
+                .iter()
+                .map(|d| d.render_human())
+                .collect::<Vec<_>>()
+        );
+        let mut found = false;
+        for item in &r.program.items {
+            if let Item::Fn(f) = item {
+                for st in &f.body.stmts {
+                    if let Stmt::Assert { expr, provenance } = st {
+                        found = true;
+                        assert!(matches!(expr, Expr::Bool(true)));
+                        assert_eq!(*provenance, AssertProvenance::human_authored());
+                    }
+                }
+            }
+        }
+        assert!(found, "expected an assert statement");
+    }
+
+    #[test]
+    fn assert_provenance_is_invisible_in_formatting() {
+        let p = Program {
+            items: vec![Item::Fn(FnDecl {
+                name: "main".to_string(),
+                params: vec![],
+                body: Block {
+                    stmts: vec![Stmt::assert_with_provenance(
+                        Expr::Bool(true),
+                        AssertProvenance::ai_generated(Some("agent-7")),
+                    )],
+                },
+            })],
+        };
+        let out = format_program(&p);
+        assert!(out.contains("assert true;"), "formatted: {out}");
+        assert!(
+            !out.contains("agent-7") && !out.contains("provenance"),
+            "formatted: {out}"
+        );
+    }
+
+    #[test]
+    fn assert_gated_off_by_default() {
+        let r = parse(FileId(0), b"fn main() { assert true; }");
+        assert!(r
+            .errors
+            .iter()
+            .any(|d| d.code == ErrorCode::UnexpectedToken));
+        for item in &r.program.items {
+            if let Item::Fn(f) = item {
+                assert!(!f
+                    .body
+                    .stmts
+                    .iter()
+                    .any(|st| matches!(st, Stmt::Assert { .. })));
+            }
+        }
     }
 
     #[test]

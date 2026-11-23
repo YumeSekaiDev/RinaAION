@@ -2,7 +2,9 @@
 
 ## Sec 5 — M4 normative (intent/goal exposure, assertions, determinism, JSON contract)
 
-M4 is docs-plus-gated-behavior only: Secs 2–4 are unchanged (the
+M4 is docs-plus-gated-behavior only: Secs 2–4 are unchanged except the
+Sec 4 code-table row naming `AION-E0044` AssertFailed (with `E0045+`
+reserved); no other Sec 2–4 rule changes (the
 `GatedGoal = 'goal' ':' Expr ';'` row in Appendix A already records the
 Goal(Expr) adoption; no `goal(Ident)` form exists). All M4 surface
 (intent blocks, goal fields, `assert` statements) is experimental,
@@ -74,7 +76,10 @@ enabled. Default-off programs behave exactly as M3.
 
 - Static: Bool checking plus literal folding only. No solver. An
   `assert` operand must type as `Bool`; otherwise the M2 `AION-E0010`
-  (TypeMismatch) rule applies.
+  (TypeMismatch) rule applies. Still-unresolved (`Var`-typed) and
+  `Error`-typed operands are exempt: the former fails later at the
+  `E0014` lowering gate, the latter already failed elsewhere. Any
+  other non-`Bool` operand type yields `E0010`.
 - `TypedStmt::Assert` is its own statement node, never routed via `Do`.
   It is a 0-cost wrapper: on success it yields nothing (see no-output
   rule below).
@@ -86,14 +91,28 @@ enabled. Default-off programs behave exactly as M3.
   `AION-E0044` trap with no operand evaluation.
 - Eligible runtime asserts evaluate their operand; `true` succeeds
   silently, `false` traps `AION-E0044` (AssertFailed) at the statement
-  span.
+  span. The diagnostic message is `assertion failed` with Error
+  severity. No `notes` or `related` locations are attached.
+- Evaluation order: the operand is fully evaluated first; operand
+  traps and fuel exhaustion during evaluation take precedence over
+  `E0044`. `E0044` is considered only after successful evaluation
+  produces `false`. Exception: literal-`false` traps unconditionally
+  without evaluating the operand and without consulting fuel.
 - Assert reads are non-moving reads that produce no ownership move
   facts: evaluating the operand never moves a `Str`, and no
   access-authority move fact is recorded for assert-operand reads.
+  This applies recursively through nested calls and subexpressions,
+  while reading an already-moved value inside an operand still
+  reports `E0020` (only new move recording is suppressed, never
+  existing diagnostics).
 - Provenance metadata: every assertion carries an origin — one of
   `human-authored`, `ai-generated`, or `transformed` (the latter
-  preserving the source assertion identity plus the transformation
-  identity, e.g. which lowering pass produced it). Provenance is
+  carrying optional tool-supplied `source_ref` and `transform_id`
+  identifiers; ordinary lowering and mandated constant folding preserve
+  existing provenance unchanged and never set `Transformed` or invent
+  identifiers — only genuine semantic rewrites or external tooling
+  that changes assertion content invoke the transformation rules).
+  Provenance is
   preserved into diagnostics but grants no authority and changes no
   rule: all assertions follow identical static and execution rules
   regardless of origin. Provenance never counts as proof.
@@ -386,7 +405,8 @@ in M3 produces output, writes state, or calls out of the program.
 | `AION-E0041` | IntOverflow | checked-arithmetic overflow (incl. `MIN / -1`, negation of `MIN`) |
 | `AION-E0042` | FuelExhausted | fuel limit exceeded |
 | `AION-E0043` | StackOverflow | call-frame limit exceeded |
-| `AION-E0044` and above | (reserved) | future runtime traps |
+| `AION-E0044` | AssertFailed | `assert` operand was `false` (statement span; literal-`false` traps unconditionally without operand eval — see Sec 5) |
+| `AION-E0045` and above | (reserved) | future runtime traps |
 
 `AION-E0014`/`AION-E0015` are static faults (no execution).
 `AION-E0030`–`AION-E0039` are internal compiler faults (never user error).

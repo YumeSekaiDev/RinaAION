@@ -56,6 +56,9 @@ impl Default for Config {
 /// Span: the offending `main`'s declaration span when one exists
 /// (threaded from the parser index at lowering time), else the
 /// module's end-of-input span (missing `main` = end of input).
+/// `Diagnostic` exceeds the lint threshold since the approved M4.4
+/// in-memory provenance field; boxing it would churn every call site.
+#[allow(clippy::result_large_err)]
 pub fn find_entry(module: &ValidatedModule) -> Result<usize, Diagnostic> {
     let inner = module.module();
     for (i, f) in inner.functions.iter().enumerate() {
@@ -176,6 +179,7 @@ impl State {
         true
     }
 
+    #[allow(clippy::result_large_err)]
     fn eval_block(
         &mut self,
         block: &TypedBlock,
@@ -198,6 +202,54 @@ impl State {
                         trailing = Some(v);
                     }
                 }
+                aion_ir::TypedStmt::Assert {
+                    expr,
+                    span,
+                    provenance,
+                } => {
+                    // M4.4 dynamic assertion: full operand evaluation
+                    // preserves trap/fuel precedence via `?`; the wrapper
+                    // charges no fuel and contributes no block value.
+                    let v = self.eval_expr(expr, env, module)?;
+                    match v {
+                        Value::Bool(true) => {}
+                        Value::Bool(false) => {
+                            let d = Diagnostic::new(ErrorCode::RuntimeTrap, "assertion failed")
+                                .with_span(*span)
+                                .with_provenance(provenance.clone());
+                            if trace::enabled() {
+                                trace::record_trap(
+                                    d.code.code_str(),
+                                    span.file.0,
+                                    span.start,
+                                    span.end,
+                                    self.depth as u64,
+                                );
+                            }
+                            return Err(d);
+                        }
+                        _ => {
+                            return Err(internal(expr, "non-bool assert operand"));
+                        }
+                    }
+                }
+                aion_ir::TypedStmt::AssertFalse { span, provenance } => {
+                    // M4.4 M3 folded false: unconditional trap. No
+                    // operand to evaluate and no fuel to consult.
+                    let d = Diagnostic::new(ErrorCode::RuntimeTrap, "assertion failed")
+                        .with_span(*span)
+                        .with_provenance(provenance.clone());
+                    if trace::enabled() {
+                        trace::record_trap(
+                            d.code.code_str(),
+                            span.file.0,
+                            span.start,
+                            span.end,
+                            self.depth as u64,
+                        );
+                    }
+                    return Err(d);
+                }
                 aion_ir::TypedStmt::Block { body } => {
                     let v = self.eval_block(body, env, module)?;
                     if last {
@@ -211,6 +263,7 @@ impl State {
         Ok(trailing.unwrap_or(Value::Unit))
     }
 
+    #[allow(clippy::result_large_err)]
     fn eval_expr(
         &mut self,
         e: &TypedExpr,
@@ -365,6 +418,7 @@ impl State {
         ));
     }
 
+    #[allow(clippy::result_large_err)]
     fn eval_unary(&self, op: UnOp, v: Value, span: ByteSpan) -> Result<Value, Diagnostic> {
         match (op, v) {
             (UnOp::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
@@ -380,6 +434,7 @@ impl State {
         }
     }
 
+    #[allow(clippy::result_large_err)]
     fn eval_binary(
         &self,
         op: BinOp,
@@ -437,6 +492,7 @@ impl State {
         }
     }
 
+    #[allow(clippy::result_large_err)]
     fn eval_call(
         &mut self,
         callee: &str,
@@ -502,6 +558,7 @@ impl State {
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn values_eq(a: &Value, b: &Value, span: ByteSpan) -> Result<bool, Diagnostic> {
     match (a, b) {
         (Value::Int(x), Value::Int(y)) => Ok(x == y),

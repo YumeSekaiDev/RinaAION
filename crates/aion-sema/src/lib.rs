@@ -127,6 +127,12 @@ struct Checker<'p> {
     retired: HashMap<ScopeId, HashMap<String, Bind>>,
     /// Block node -> scope id for every block entered during checking.
     block_scopes: HashMap<NodeId, ScopeId>,
+    /// M4.4: while true, assertion operand checking records no new
+    /// call-argument move facts (non-moving reads). Scoped to the
+    /// operand of the assert statement being checked; `let`
+    /// initializers and trailing returns are statement-level and
+    /// therefore never observe it.
+    in_assert_operand: bool,
 }
 
 impl<'p> Checker<'p> {
@@ -511,7 +517,13 @@ impl<'p> Checker<'p> {
                 {
                     if matches!(a, Expr::Ident(_)) && !self.is_copy(t) {
                         if let Expr::Ident(nm) = a {
-                            self.mark_moved(nm, *s, a_ids.node, t.clone());
+                            // M4.4: assertion operand reads are non-moving.
+                            // Only the call-argument path is gated; `let`
+                            // initializers and trailing returns never run
+                            // under this flag.
+                            if !self.in_assert_operand {
+                                self.mark_moved(nm, *s, a_ids.node, t.clone());
+                            }
                         }
                     }
                 }
@@ -905,18 +917,35 @@ impl<'p> Checker<'p> {
                     self.expr_tys.insert(*node, Ity::Unit);
                 }
                 (
-                    Stmt::Assert(e),
+                    Stmt::Assert {
+                        expr: e,
+                        provenance,
+                    },
                     StmtIds::Assert {
                         node,
                         expr: expr_ids,
                     },
                 ) => {
+                    // M4.4: assertion operand reads are non-moving, but
+                    // use-after-move detection for genuinely moved values
+                    // stays active.
+                    let prev = std::mem::replace(&mut self.in_assert_operand, true);
                     let (t, s) = self.check_expr(e, expr_ids);
+                    self.in_assert_operand = prev;
                     self.expr_tys.insert(*node, Ity::Unit);
                     if !matches!(self.resolve(&t), Ity::Error | Ity::Var(_))
                         && self.resolve(&t) != Ity::Bool
                     {
-                        self.type_mismatch(s);
+                        // Assertion-specific E0010 carries the assertion's
+                        // provenance. Unrelated E0010 paths are untouched.
+                        self.diags.push(
+                            Diagnostic::new(
+                                ErrorCode::TypeMismatch,
+                                "operand type mismatch".to_string(),
+                            )
+                            .with_span(s)
+                            .with_provenance(provenance.clone()),
+                        );
                     }
                     let _ = i;
                 }
@@ -1134,6 +1163,20 @@ fn collect_intent_goals(
             (Stmt::Block(inner), StmtIds::Block { body, .. }) => {
                 collect_intent_goals(ck, inner, body, out, base);
             }
+            (Stmt::Assert { provenance, .. }, StmtIds::Assert { node, .. }) => {
+                // M4.4 E0016: `assert` is rejected inside intent blocks
+                // at any nesting level. Intent bodies are only ever
+                // visited here (never by the statement checker), so this
+                // cannot emit duplicates. `let`/`do` stay unaffected.
+                ck.diags.push(
+                    Diagnostic::new(
+                        ErrorCode::AssertInIntent,
+                        "assert statements are not allowed in intent blocks".to_string(),
+                    )
+                    .with_span(ck.span(*node))
+                    .with_provenance(provenance.clone()),
+                );
+            }
             _ => {}
         }
     }
@@ -1170,6 +1213,7 @@ fn check_clean(parse: &ParseResult, file: aion_span::FileId, _bytes: &[u8]) -> C
         cur_fn_goals: Vec::new(),
         retired: HashMap::new(),
         block_scopes: HashMap::new(),
+        in_assert_operand: false,
     };
     if parse.program.items.len() != parse.index.items.len() {
         ck.index_mismatch("top-level item count differs from index");

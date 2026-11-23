@@ -18,6 +18,139 @@ fn lower_clean(src: &str) -> (TypedModule, ParseResult) {
     (m, parse)
 }
 
+fn parse_check_flags(
+    src: &str,
+    flags: aion_syntax::FeatureFlags,
+) -> (ParseResult, aion_sem_model::SemModel, Vec<Diagnostic>) {
+    let file = FileId(0);
+    let parse = aion_syntax::parse_with_flags(file, src.as_bytes(), flags);
+    assert!(parse.errors.is_empty(), "parse errors: {:?}", parse.errors);
+    let (diags, model) = aion_sema::check_with_model(&parse, file, src.as_bytes());
+    (parse, model, diags)
+}
+
+fn assert_flags() -> aion_syntax::FeatureFlags {
+    aion_syntax::FeatureFlags {
+        intent: false,
+        goal: false,
+        assert_stmt: true,
+    }
+}
+
+fn lower_flags(src: &str) -> (TypedModule, ParseResult) {
+    let (parse, model, diags) = parse_check_flags(src, assert_flags());
+    assert!(diags.is_empty(), "sema diags: {:?}", diags);
+    let (m, ldiags) = lower(&parse, &model, FileId(0), src.len() as u32);
+    assert!(ldiags.is_empty(), "lower diags: {:?}", ldiags);
+    (m, parse)
+}
+
+#[test]
+fn assert_lowers_to_distinct_typed_assert() {
+    // Non-literal operand keeps the dynamic path (a bare `true`
+    // literal would be eliminated by M3 folding). The test derives
+    // the expected span from the recorded index instead of hard-coding it.
+    let src = "fn main() { assert 1 == 1; }";
+    let (parse, model, diags) = parse_check_flags(src, assert_flags());
+    assert!(diags.is_empty(), "sema diags: {:?}", diags);
+    let (m, ldiags) = lower(&parse, &model, FileId(0), src.len() as u32);
+    assert!(ldiags.is_empty(), "lower diags: {:?}", ldiags);
+    let main = &m.functions[0];
+    assert_eq!(main.body.stmts.len(), 1);
+    // No block value: assertions contribute nothing.
+    assert_eq!(main.body.value, Ty::Unit);
+    let mut stmt_span = None;
+    for item in &parse.index.items {
+        if let ItemIds::Fn(fids) = item {
+            for sid in &fids.body.stmts {
+                if let StmtIds::Assert { node, .. } = sid {
+                    stmt_span = parse.spans.get(*node);
+                }
+            }
+        }
+    }
+    match &main.body.stmts[0] {
+        TypedStmt::Assert {
+            expr,
+            span,
+            provenance,
+        } => {
+            assert_eq!(expr.ty, Ty::Bool);
+            assert_eq!(*provenance, AssertProvenance::human_authored());
+            assert_eq!(Some(*span), stmt_span, "typed assert keeps statement span");
+        }
+        s => panic!("expected TypedStmt::Assert, got {s:?}"),
+    }
+}
+
+fn assert_stmt_node(parse: &ParseResult) -> ByteSpan {
+    for item in &parse.index.items {
+        if let ItemIds::Fn(fids) = item {
+            for sid in &fids.body.stmts {
+                if let StmtIds::Assert { node, .. } = sid {
+                    return parse.spans.get(*node).expect("assert stmt span recorded");
+                }
+            }
+        }
+    }
+    panic!("no assert statement in index");
+}
+
+#[test]
+fn assert_true_is_eliminated() {
+    // Eliminated completely: no node survives, and a preceding
+    // trailing value is preserved as if the statement never existed.
+    let (m, _) = lower_flags("fn main() { assert true; }");
+    assert!(m.functions[0].body.stmts.is_empty());
+    assert_eq!(m.functions[0].body.value, Ty::Unit);
+    let (m, _) = lower_flags("fn main() { do 1; assert true; }");
+    assert_eq!(m.functions[0].body.stmts.len(), 1);
+    assert!(matches!(m.functions[0].body.stmts[0], TypedStmt::Do { .. }));
+    assert_eq!(m.functions[0].body.value, Ty::Int);
+}
+
+#[test]
+fn assert_false_folds_to_unconditional_trap() {
+    let src = "fn main() { assert false; }";
+    let (m, parse) = lower_flags(src);
+    let main = &m.functions[0];
+    assert_eq!(main.body.stmts.len(), 1);
+    assert_eq!(main.body.value, Ty::Unit);
+    match &main.body.stmts[0] {
+        TypedStmt::AssertFalse { span, provenance } => {
+            assert_eq!(*span, assert_stmt_node(&parse));
+            assert_eq!(*provenance, AssertProvenance::human_authored());
+        }
+        s => panic!("expected folded AssertFalse, got {s:?}"),
+    }
+    // The folded representation validates clean.
+    crate::validate(&m).expect("folded assert must validate");
+}
+
+#[test]
+fn assert_non_literal_keeps_dynamic_behavior() {
+    // Inferred constants and computed expressions are never folded.
+    let src = "fn main() { let x = false; assert x; assert 1 == 1; }";
+    let (m, _) = lower_flags(src);
+    let main = &m.functions[0];
+    assert_eq!(main.body.stmts.len(), 3);
+    assert!(matches!(main.body.stmts[1], TypedStmt::Assert { .. }));
+    assert!(matches!(main.body.stmts[2], TypedStmt::Assert { .. }));
+}
+
+#[test]
+fn assert_non_bool_operand_is_e0010() {
+    // M1 semantic precondition lock: invalid assertions never reach
+    // lowering or execution.
+    let src = "fn main() { assert 1; }";
+    let (_, _, diags) = parse_check_flags(src, assert_flags());
+    assert!(
+        diags.iter().any(|d| d.code == ErrorCode::TypeMismatch),
+        "expected E0010, got {:?}",
+        diags.iter().map(|d| d.render_human()).collect::<Vec<_>>()
+    );
+}
+
 fn all_spans(parse: &ParseResult) -> Vec<ByteSpan> {
     // Collect every recorded span by walking ids in lockstep with the AST.
     let mut out = Vec::new();
@@ -267,6 +400,9 @@ fn spans_come_from_parse_table() {
             match s {
                 TypedStmt::Let { init, .. } => expr_spans(init, &mut got),
                 TypedStmt::Do { expr } => expr_spans(expr, &mut got),
+                TypedStmt::Assert { expr, .. } => expr_spans(expr, &mut got),
+                // Folded false carries no operand expression.
+                TypedStmt::AssertFalse { .. } => {}
                 TypedStmt::Block { body } => {
                     for s2 in &body.stmts {
                         if let TypedStmt::Do { expr } = s2 {
@@ -738,7 +874,9 @@ fn ident_uses_in_order(parse: &ParseResult) -> Vec<NodeId> {
                 (Stmt::Block(inner), StmtIds::Block { body: ibids, .. }) => {
                     block(inner, ibids, out)
                 }
-                (Stmt::Assert(ex), StmtIds::Assert { expr: eids, .. }) => expr(ex, eids, out),
+                (Stmt::Assert { expr: ex, .. }, StmtIds::Assert { expr: eids, .. }) => {
+                    expr(ex, eids, out)
+                }
                 _ => {}
             }
         }
@@ -775,6 +913,9 @@ fn lowered_accesses_in_order(m: &TypedModule) -> Vec<LocalAccess> {
             match st {
                 TypedStmt::Let { init, .. } => expr(init, out),
                 TypedStmt::Do { expr: e } => expr(e, out),
+                TypedStmt::Assert { expr: e, .. } => expr(e, out),
+                // Folded false records no accesses.
+                TypedStmt::AssertFalse { .. } => {}
                 TypedStmt::Block { body } => block(body, out),
                 TypedStmt::Empty => {}
             }

@@ -2,6 +2,7 @@
 //! fuel determinism, recursion cap, moves, entry, no-output.
 
 use super::*;
+use aion_error::AssertProvenance;
 use aion_ir::{TypedFn, TypedModule, ValidatedModule};
 use aion_sem_model::Ty;
 use aion_span::{ByteSpan, FileId};
@@ -78,6 +79,128 @@ fn trap_of(r: RunResult) -> Diagnostic {
         RunResult::Trap(d) => d,
         RunResult::Ok(o) => panic!("expected trap, got {o:?}"),
     }
+}
+
+fn assert_block(e: TypedExpr, span: ByteSpan) -> TypedBlock {
+    TypedBlock {
+        stmts: vec![aion_ir::TypedStmt::Assert {
+            expr: e,
+            span,
+            provenance: AssertProvenance::human_authored(),
+        }],
+        value: Ty::Unit,
+    }
+}
+
+#[test]
+fn assert_true_succeeds_silently() {
+    let m = main_fn(assert_block(boolean(true, 11, 15), sp(4, 16)));
+    match execute(&validated(&m), &Config::default()) {
+        RunResult::Ok(o) => assert_eq!(o.value, Value::Unit),
+        RunResult::Trap(d) => panic!("unexpected trap {d:?}"),
+    }
+}
+
+#[test]
+fn assert_false_traps_e0044_with_span_and_provenance() {
+    let stmt_span = sp(4, 17);
+    let m = main_fn(assert_block(boolean(false, 11, 16), stmt_span));
+    let d = trap_of(execute(&validated(&m), &Config::default()));
+    assert_eq!(d.code, ErrorCode::RuntimeTrap);
+    assert_eq!(d.code.code_str(), "AION-E0044");
+    assert_eq!(d.message, "assertion failed");
+    assert_eq!(d.severity, aion_error::Severity::Error);
+    assert_eq!(d.span, Some(stmt_span));
+    assert!(d.notes.is_empty() && d.related.is_empty());
+    assert_eq!(d.provenance, Some(AssertProvenance::human_authored()));
+}
+
+#[test]
+fn assert_operand_fuel_exhaustion_precedes_e0044() {
+    // Operand `1+2` needs 3 fuel; with 2 the evaluation traps before
+    // E0044 is ever considered.
+    let cfg = Config {
+        fuel: 2,
+        frames: 1024,
+    };
+    let operand = expr(
+        Ty::Int,
+        0,
+        5,
+        ExprKind::Binary {
+            op: BinOp::Add,
+            lhs: Box::new(int(1, 0, 1)),
+            rhs: Box::new(int(2, 4, 5)),
+        },
+    );
+    let m = main_fn(assert_block(operand, sp(0, 5)));
+    let d = trap_of(execute(&validated(&m), &cfg));
+    assert_eq!(d.code, ErrorCode::FuelExhausted);
+    assert_eq!(d.code.code_str(), "AION-E0042");
+}
+
+fn assert_false_block(span: ByteSpan) -> TypedBlock {
+    TypedBlock {
+        stmts: vec![aion_ir::TypedStmt::AssertFalse {
+            span,
+            provenance: AssertProvenance::human_authored(),
+        }],
+        value: Ty::Unit,
+    }
+}
+
+#[test]
+fn folded_false_traps_without_evaluation_or_fuel() {
+    // Zero fuel: any operand evaluation or fuel consultation would
+    // trap FuelExhausted instead. The folded path uses neither.
+    let stmt_span = sp(4, 18);
+    let m = main_fn(assert_false_block(stmt_span));
+    let cfg = Config {
+        fuel: 0,
+        frames: 1024,
+    };
+    let d = trap_of(execute(&validated(&m), &cfg));
+    assert_eq!(d.code, ErrorCode::RuntimeTrap);
+    assert_eq!(d.code.code_str(), "AION-E0044");
+    assert_eq!(d.message, "assertion failed");
+    assert_eq!(d.severity, aion_error::Severity::Error);
+    assert_eq!(d.span, Some(stmt_span));
+    assert!(d.notes.is_empty() && d.related.is_empty());
+    assert_eq!(d.provenance, Some(AssertProvenance::human_authored()));
+}
+
+#[test]
+fn folded_false_trap_is_recorded_with_statement_span() {
+    let stmt_span = sp(4, 18);
+    let m = main_fn(assert_false_block(stmt_span));
+    let validated_m = validated(&m);
+    let (r, bytes) = trace::with_observer(|| execute(&validated_m, &Config::default()));
+    let d = trap_of(r);
+    assert_eq!(d.code.code_str(), "AION-E0044");
+    let s = String::from_utf8(bytes).expect("trace bytes are utf-8");
+    assert!(s.contains("\"kind\":\"trap\""), "trap event recorded: {s}");
+    assert!(s.contains("\"code\":\"AION-E0044\""), "trap code: {s}");
+    assert!(
+        s.contains("\"start\":4") && s.contains("\"end\":18"),
+        "statement span: {s}"
+    );
+}
+
+#[test]
+fn assert_false_trap_is_recorded_with_statement_span() {
+    let stmt_span = sp(4, 17);
+    let m = main_fn(assert_block(boolean(false, 11, 16), stmt_span));
+    let validated_m = validated(&m);
+    let (r, bytes) = trace::with_observer(|| execute(&validated_m, &Config::default()));
+    let d = trap_of(r);
+    assert_eq!(d.code.code_str(), "AION-E0044");
+    let s = String::from_utf8(bytes).expect("trace bytes are utf-8");
+    assert!(s.contains("\"kind\":\"trap\""), "trap event recorded: {s}");
+    assert!(s.contains("\"code\":\"AION-E0044\""), "trap code: {s}");
+    assert!(
+        s.contains("\"start\":4") && s.contains("\"end\":17"),
+        "statement span: {s}"
+    );
 }
 
 #[test]

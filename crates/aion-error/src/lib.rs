@@ -54,6 +54,8 @@ pub enum ErrorCode {
     InternalIrInvalid = 30,
     /// Missing / bad entry point (no zero-param `fn main`).
     EntryPointInvalid = 15,
+    /// `assert` statement inside an intent block (M4.4, static rejection).
+    AssertInIntent = 16,
     /// Integer division / remainder by zero.
     DivByZero = 40,
     /// Integer overflow (incl. `MIN / -1` and negation of `MIN`).
@@ -81,12 +83,141 @@ impl ErrorCode {
             ErrorCode::UseAfterMove => "AION-E0020",
             ErrorCode::InternalIrInvalid => "AION-E0030",
             ErrorCode::EntryPointInvalid => "AION-E0015",
+            ErrorCode::AssertInIntent => "AION-E0016",
             ErrorCode::DivByZero => "AION-E0040",
             ErrorCode::IntOverflow => "AION-E0041",
             ErrorCode::FuelExhausted => "AION-E0042",
             ErrorCode::StackOverflow => "AION-E0043",
             ErrorCode::RuntimeTrap => "AION-E0044",
         }
+    }
+}
+
+/// Assertion provenance origin (M4.4, S1).
+///
+/// Identity details are separate from this classification. Provenance is
+/// non-authoritative metadata: it never influences type checking,
+/// inference, move analysis, execution, fuel accounting, or trap
+/// decisions.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum AssertOrigin {
+    /// Plain source assertion (default convention, not verified authorship).
+    #[default]
+    HumanAuthored,
+    /// Marked `AiGenerated` by trusted tooling via the approved API.
+    AiGenerated,
+    /// Marked `Transformed` by a genuine semantic rewrite or external
+    /// tooling that changed assertion content.
+    Transformed,
+}
+
+/// Assertion provenance (M4.4, S1–S4, S6).
+///
+/// Fields are private; construction goes through the constructors below
+/// and read access through the accessors. Empty identifier strings
+/// normalize to absent at every boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AssertProvenance {
+    origin: AssertOrigin,
+    generator: Option<String>,
+    source_ref: Option<String>,
+    transform_id: Option<String>,
+}
+
+fn normalize_id(s: Option<String>) -> Option<String> {
+    match s {
+        Some(v) if v.is_empty() => None,
+        other => other,
+    }
+}
+
+impl AssertProvenance {
+    /// Plain source assertion: `HumanAuthored`, no identifiers.
+    pub fn human_authored() -> Self {
+        Self {
+            origin: AssertOrigin::HumanAuthored,
+            generator: None,
+            source_ref: None,
+            transform_id: None,
+        }
+    }
+
+    /// `AiGenerated` with optional opaque generator identity.
+    /// Empty identity normalizes to absent; missing identity does not
+    /// change the classification.
+    pub fn ai_generated(generator: Option<impl Into<String>>) -> Self {
+        Self {
+            origin: AssertOrigin::AiGenerated,
+            generator: normalize_id(generator.map(Into::into)),
+            source_ref: None,
+            transform_id: None,
+        }
+    }
+
+    /// `Transformed` with optional opaque identifiers. Empty identifiers
+    /// normalize to absent; missing identifiers never downgrade the
+    /// classification.
+    pub fn transformed<S: Into<String>, T: Into<String>>(
+        source_ref: Option<S>,
+        transform_id: Option<T>,
+    ) -> Self {
+        Self {
+            origin: AssertOrigin::Transformed,
+            generator: None,
+            source_ref: normalize_id(source_ref.map(Into::into)),
+            transform_id: normalize_id(transform_id.map(Into::into)),
+        }
+    }
+
+    /// Origin classification.
+    pub fn origin(&self) -> AssertOrigin {
+        self.origin.clone()
+    }
+
+    /// Apply a genuine semantic transformation (M4.4 M1).
+    ///
+    /// Only genuine semantic AST rewrites or external tooling that
+    /// changes assertion content may call this; formatting-only and
+    /// representation-only changes must preserve provenance instead.
+    /// Existing fields are first normalized by the current origin
+    /// (incompatible identifiers are discarded), then the approved
+    /// transition rules apply: earliest non-empty `source_ref` is
+    /// preserved (a new one is accepted only when none was known), a
+    /// new non-empty `transform_id` replaces the previous one (otherwise
+    /// retained), AI identity is discarded, origins never downgrade,
+    /// and no history is retained.
+    pub fn apply_transform<S: Into<String>, T: Into<String>>(
+        &self,
+        source_ref: Option<S>,
+        transform_id: Option<T>,
+    ) -> Self {
+        let new_src = normalize_id(source_ref.map(Into::into));
+        let new_tid = normalize_id(transform_id.map(Into::into));
+        let (kept_src, kept_tid) = match self.origin {
+            AssertOrigin::Transformed => (self.source_ref.clone(), self.transform_id.clone()),
+            _ => (None, None),
+        };
+        Self {
+            origin: AssertOrigin::Transformed,
+            generator: None,
+            source_ref: kept_src.or(new_src),
+            transform_id: new_tid.or(kept_tid),
+        }
+    }
+
+    /// Opaque generator identity (`AiGenerated` only).
+    pub fn generator(&self) -> Option<&str> {
+        self.generator.as_deref()
+    }
+
+    /// Earliest known non-empty source reference (`Transformed` only).
+    pub fn source_ref(&self) -> Option<&str> {
+        self.source_ref.as_deref()
+    }
+
+    /// Latest meaningful transformation identifier (`Transformed` only).
+    pub fn transform_id(&self) -> Option<&str> {
+        self.transform_id.as_deref()
     }
 }
 
@@ -99,6 +230,11 @@ pub struct Diagnostic {
     pub span: Option<ByteSpan>,
     pub notes: Vec<String>,
     pub related: Vec<(ByteSpan, String)>,
+    /// In-memory assertion provenance (M4.4). `Some` marks an
+    /// assertion-related diagnostic; `None` marks an unrelated one.
+    /// Omitted from canonical JSON when `None` or `HumanAuthored`
+    /// (serialization belongs to M5).
+    pub provenance: Option<AssertProvenance>,
 }
 
 impl Diagnostic {
@@ -110,6 +246,7 @@ impl Diagnostic {
             span: None,
             notes: Vec::new(),
             related: Vec::new(),
+            provenance: None,
         }
     }
 
@@ -130,6 +267,14 @@ impl Diagnostic {
 
     pub fn with_related(mut self, span: ByteSpan, label: impl Into<String>) -> Self {
         self.related.push((span, label.into()));
+        self
+    }
+
+    /// Attach in-memory assertion provenance (M4.4). Generic over
+    /// diagnostics; the S6 no-generic-setter rule constrains only the
+    /// AST API.
+    pub fn with_provenance(mut self, provenance: AssertProvenance) -> Self {
+        self.provenance = Some(provenance);
         self
     }
 
@@ -436,6 +581,7 @@ fn parse_diagnostic(raw: &str) -> Result<Diagnostic, String> {
         Some("AION-E0020") => ErrorCode::UseAfterMove,
         Some("AION-E0030") => ErrorCode::InternalIrInvalid,
         Some("AION-E0015") => ErrorCode::EntryPointInvalid,
+        Some("AION-E0016") => ErrorCode::AssertInIntent,
         Some("AION-E0040") => ErrorCode::DivByZero,
         Some("AION-E0041") => ErrorCode::IntOverflow,
         Some("AION-E0042") => ErrorCode::FuelExhausted,
@@ -462,6 +608,9 @@ fn parse_diagnostic(raw: &str) -> Result<Diagnostic, String> {
         span,
         notes,
         related,
+        // M0 structural compatibility: keyless diagnostics initialize
+        // provenance to `None`. Provenance wire parsing belongs to M5.
+        provenance: None,
     })
 }
 
@@ -820,6 +969,26 @@ mod tests {
         assert_eq!(ErrorCode::FuelExhausted.code_str(), "AION-E0042");
         assert_eq!(ErrorCode::StackOverflow.code_str(), "AION-E0043");
         assert_eq!(ErrorCode::RuntimeTrap.code_str(), "AION-E0044");
+        assert_eq!(ErrorCode::AssertInIntent.code_str(), "AION-E0016");
+    }
+
+    #[test]
+    fn e0016_assert_in_intent_round_trip() {
+        let d = Diagnostic::new(
+            ErrorCode::AssertInIntent,
+            "assert statements are not allowed in intent blocks",
+        )
+        .with_span(ByteSpan::empty(FileId(0), 7));
+        let bytes = Diagnostic::canonical_envelope_bytes(&[d]);
+        let back = parse_envelope(&bytes).expect("envelope must parse");
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].code, ErrorCode::AssertInIntent);
+        assert_eq!(
+            back[0].message,
+            "assert statements are not allowed in intent blocks"
+        );
+        assert_eq!(back[0].span, Some(ByteSpan::empty(FileId(0), 7)));
+        assert_eq!(back[0].provenance, None);
     }
 
     #[test]
@@ -835,5 +1004,68 @@ mod tests {
         // No-span diagnostic renders null span.
         let j2 = Diagnostic::new(ErrorCode::ParseError, "x\"\\\n").render_json();
         assert!(j2.contains("\"span\":null") && j2.contains("\\\""));
+    }
+
+    #[test]
+    fn default_provenance_is_human_authored_absent() {
+        let p = AssertProvenance::default();
+        assert_eq!(p.origin(), AssertOrigin::HumanAuthored);
+        assert_eq!(p.generator(), None);
+        assert_eq!(p.source_ref(), None);
+        assert_eq!(p.transform_id(), None);
+        assert_eq!(
+            AssertProvenance::human_authored(),
+            AssertProvenance::default()
+        );
+        let d = Diagnostic::new(ErrorCode::ParseError, "x");
+        assert_eq!(d.provenance, None);
+    }
+
+    #[test]
+    fn provenance_transitions_follow_approved_rules() {
+        // HumanAuthored -> Transformed.
+        let t = AssertProvenance::human_authored().apply_transform::<String, String>(None, None);
+        assert_eq!(t.origin(), AssertOrigin::Transformed);
+        assert_eq!(t.source_ref(), None);
+        assert_eq!(t.transform_id(), None);
+        let t = AssertProvenance::human_authored()
+            .apply_transform(Some("s1".to_string()), Some("t1".to_string()));
+        assert_eq!(t.source_ref(), Some("s1"));
+        assert_eq!(t.transform_id(), Some("t1"));
+        // Empty identifiers normalize to absent.
+        let t = AssertProvenance::human_authored()
+            .apply_transform(Some(String::new()), Some(String::new()));
+        assert_eq!(t.source_ref(), None);
+        assert_eq!(t.transform_id(), None);
+
+        // AiGenerated -> Transformed discards generator identity.
+        let ai = AssertProvenance::ai_generated(Some("agent-7"));
+        assert_eq!(ai.generator(), Some("agent-7"));
+        let t = ai.apply_transform(Some("s".to_string()), None::<String>);
+        assert_eq!(t.origin(), AssertOrigin::Transformed);
+        assert_eq!(t.generator(), None);
+        assert_eq!(t.source_ref(), Some("s"));
+        assert_eq!(t.transform_id(), None);
+        // Empty generator normalizes to absent at construction.
+        assert_eq!(
+            AssertProvenance::ai_generated(Some(String::new())).generator(),
+            None
+        );
+
+        // Transformed -> Transformed: replacement, retention, late supply.
+        let base = AssertProvenance::transformed(Some("orig".to_string()), Some("t1".to_string()));
+        let t = base.apply_transform(Some("new".to_string()), Some("t2".to_string()));
+        assert_eq!(t.source_ref(), Some("orig"));
+        assert_eq!(t.transform_id(), Some("t2"));
+        let t = base.apply_transform::<String, String>(None, None);
+        assert_eq!(t.source_ref(), Some("orig"));
+        assert_eq!(t.transform_id(), Some("t1"));
+        // Late source supply with no new transform id.
+        let srcless = AssertProvenance::transformed(None::<String>, Some("t9".to_string()));
+        let t = srcless.apply_transform(Some("late".to_string()), None::<String>);
+        assert_eq!(t.source_ref(), Some("late"));
+        assert_eq!(t.transform_id(), Some("t9"));
+        // Never downgrades.
+        assert_eq!(t.origin(), AssertOrigin::Transformed);
     }
 }

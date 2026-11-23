@@ -72,7 +72,7 @@ fn collect_stmt(stmt: &Stmt, out: &mut Vec<String>) {
         Stmt::Let { expr, .. } => collect_expr(expr, out),
         Stmt::Do(e) => collect_expr(e, out),
         Stmt::Block(b) => collect_block(b, out),
-        Stmt::Assert(e) => collect_expr(e, out),
+        Stmt::Assert { expr: e, .. } => collect_expr(e, out),
         Stmt::Goal(_) | Stmt::Empty => {}
     }
 }

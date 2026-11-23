@@ -196,10 +196,37 @@ impl Oracle {
                         trailing = Some(v);
                     }
                 }
-                (Stmt::Assert(e), StmtIds::Assert { expr: eids, .. }) => {
-                    // Experimental; unreachable on clean parses. Mirror
-                    // lowering: evaluate for shape, discard the value.
-                    let _ = self.eval_expr(parse, e, eids, false, fns, env)?;
+                (
+                    Stmt::Assert {
+                        expr: e,
+                        provenance,
+                    },
+                    StmtIds::Assert { node, expr: eids },
+                ) => {
+                    // M4.4: AST assertion semantics. Evaluate the operand;
+                    // `true` succeeds silently, `false` fails through the
+                    // oracle failure path with the original statement
+                    // span and the assertion's provenance. Separate from
+                    // the typed runtime evaluator: no trace recording
+                    // happens here.
+                    let (v, _) = self.eval_expr(parse, e, eids, false, fns, env)?;
+                    match v {
+                        Value::Bool(true) => {}
+                        Value::Bool(false) => {
+                            return Err(Diagnostic::new(
+                                ErrorCode::RuntimeTrap,
+                                "assertion failed",
+                            )
+                            .with_span(self.span(parse, *node))
+                            .with_provenance(provenance.clone()));
+                        }
+                        _ => {
+                            return Err(oracle_internal(
+                                self.span(parse, *node),
+                                "non-bool assert operand",
+                            ));
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -905,6 +932,11 @@ mod harness {
                 aion_ir::TypedStmt::Do { expr } => {
                     check_expr_spans(expr, text, recorded, rel, count)
                 }
+                aion_ir::TypedStmt::Assert { expr, .. } => {
+                    check_expr_spans(expr, text, recorded, rel, count)
+                }
+                // Folded false carries no operand expression.
+                aion_ir::TypedStmt::AssertFalse { .. } => {}
                 aion_ir::TypedStmt::Block { body } => {
                     check_block_spans(body, text, recorded, rel, count)
                 }
@@ -964,6 +996,103 @@ mod harness {
                 super::super::RunResult::Ok(o) => assert_eq!(o.value, Value::Unit, "{rel}"),
                 super::super::RunResult::Trap(d) => panic!("{rel} trapped: {}", d.render_human()),
             }
+        }
+    }
+
+    /// Parse inline source with assertions enabled (gated syntax).
+    fn parse_assert(src: &str) -> aion_syntax::ParseResult {
+        let r = aion_syntax::parse_with_flags(
+            FileId(0),
+            src.as_bytes(),
+            aion_syntax::FeatureFlags::all_experimental(),
+        );
+        assert!(
+            r.errors.is_empty(),
+            "assert source must parse clean: {src:?}: {:?}",
+            r.errors
+                .iter()
+                .map(|d| d.render_human())
+                .collect::<Vec<_>>()
+        );
+        r
+    }
+
+    /// Recorded statement span of the first assert in the program.
+    fn first_assert_span(parse: &aion_syntax::ParseResult) -> aion_span::ByteSpan {
+        for item in &parse.index.items {
+            if let aion_syntax::ItemIds::Fn(fids) = item {
+                for sid in &fids.body.stmts {
+                    if let aion_syntax::StmtIds::Assert { node, .. } = sid {
+                        return parse.spans.get(*node).expect("assert stmt span recorded");
+                    }
+                }
+            }
+        }
+        panic!("no assert statement in index");
+    }
+
+    #[test]
+    fn oracle_assert_true_succeeds() {
+        for src in ["fn main() { assert true; }", "fn main() { assert 1 == 1; }"] {
+            let parse = parse_assert(src);
+            let (v, _) = eval_program(&parse, 1_000_000, 1024)
+                .unwrap_or_else(|d| panic!("{src}: oracle trapped: {}", d.render_human()));
+            assert_eq!(v, Value::Unit, "{src}: assert success yields nothing");
+        }
+    }
+
+    #[test]
+    fn oracle_assert_false_fails_with_statement_span() {
+        for src in [
+            "fn main() { assert false; }",
+            "fn main() { assert 1 == 2; }",
+        ] {
+            let parse = parse_assert(src);
+            let expected = first_assert_span(&parse);
+            let d = eval_program(&parse, 1_000_000, 1024)
+                .err()
+                .unwrap_or_else(|| panic!("{src}: oracle must fail"));
+            assert_eq!(d.code, ErrorCode::RuntimeTrap, "{src}: failure code");
+            assert_eq!(d.code.code_str(), "AION-E0044", "{src}");
+            assert_eq!(d.message, "assertion failed", "{src}");
+            // Exact recorded statement span — not the operand span
+            // and not a reconstructed span.
+            assert_eq!(d.span, Some(expected), "{src}: statement span");
+            // Parsed assertions carry HumanAuthored provenance.
+            assert_eq!(
+                d.provenance,
+                Some(aion_error::AssertProvenance::human_authored()),
+                "{src}: provenance preserved"
+            );
+        }
+    }
+
+    #[test]
+    fn oracle_assert_false_preserves_tool_provenance() {
+        // Non-default provenance set by tooling must survive to the
+        // oracle E0044 for both literal and dynamic false operands.
+        for src in [
+            "fn main() { assert false; }",
+            "fn main() { assert 1 == 2; }",
+        ] {
+            let mut parse = parse_assert(src);
+            let expected = first_assert_span(&parse);
+            let tool = aion_error::AssertProvenance::ai_generated(Some("agent-7"));
+            for item in &mut parse.program.items {
+                if let aion_syntax::Item::Fn(f) = item {
+                    for st in &mut f.body.stmts {
+                        if let aion_syntax::Stmt::Assert { provenance, .. } = st {
+                            *provenance = tool.clone();
+                        }
+                    }
+                }
+            }
+            let d = eval_program(&parse, 1_000_000, 1024)
+                .err()
+                .unwrap_or_else(|| panic!("{src}: oracle must fail"));
+            assert_eq!(d.code.code_str(), "AION-E0044", "{src}");
+            assert_eq!(d.span, Some(expected), "{src}: statement span");
+            assert_eq!(d.provenance, Some(tool.clone()), "{src}: tool provenance");
         }
     }
 }
