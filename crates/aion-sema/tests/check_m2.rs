@@ -584,7 +584,7 @@ fn m2_copy_param_inferred_through_call_never_moves() {
 fn m2_index_mismatch_is_controlled_diagnostic() {
     // Adversarial pairing: program from one parse, index/spans from another
     // with a different item count. Must not panic; yields exactly the
-    // controlled ParseError diagnostic.
+    // controlled internal-pipeline diagnostic.
     let a = b"fn f() { do 1; }";
     let b_src = b"fn f() { do 1; }\nfn g() { do 2; }";
     let mut r = aion_syntax::parse(FileId(0), a);
@@ -594,7 +594,8 @@ fn m2_index_mismatch_is_controlled_diagnostic() {
     r.spans = other.spans;
     let ds = aion_sema::check(&r, FileId(0), a);
     assert_eq!(ds.len(), 1, "{ds:?}");
-    assert_eq!(ds[0].code, ErrorCode::ParseError);
+    assert_eq!(ds[0].code, ErrorCode::InternalIrInvalid);
+    assert_eq!(ds[0].code.code_str(), "AION-E0030");
 }
 
 #[test]

@@ -9,3 +9,6 @@ aion-error = { path = "../aion-error" }
 aion-span = { path = "../aion-span" }
 aion-syntax = { path = "../aion-syntax" }
 aion-sem-model = { path = "../aion-sem-model" }
+
+[dev-dependencies]
+aion-sema = { path = "../aion-sema" }

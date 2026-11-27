@@ -14,6 +14,7 @@
 
 use super::{find_entry, Config, Env, State, Value};
 use aion_error::{Diagnostic, ErrorCode};
+use aion_sem_model::ScopeTree;
 use aion_span::{ByteSpan, FileId};
 use aion_syntax::{
     BinOp, Block, BlockIds, Expr, ExprIds, ExprIdsKind, FnDecl, FnIds, ParseResult, ProgramIds,
@@ -33,6 +34,7 @@ use std::collections::{HashMap, HashSet};
 ///
 /// `Err` carries the entry fault or the runtime trap, exactly as
 /// [`super::execute`] would report it.
+#[allow(clippy::result_large_err)]
 pub(crate) fn ir_main_value(
     module: &aion_ir::ValidatedModule,
     config: &Config,
@@ -69,6 +71,7 @@ struct Oracle {
 }
 
 impl Oracle {
+    #[allow(clippy::result_large_err)]
     fn charge(&mut self, span: ByteSpan) -> Result<(), Diagnostic> {
         if self.used >= self.fuel {
             return Err(
@@ -80,6 +83,46 @@ impl Oracle {
     }
 }
 
+/// Test-only block-to-scope map for hand-built models: assigns a fresh
+/// [`ScopeId`](aion_sem_model::ScopeId) to every block reachable from
+/// function bodies, mirroring the checker's walk (nested `Stmt::Block`
+/// recursion; intent bodies excluded). Lets tests that bypass sema
+/// satisfy the fail-closed lowering gate with explicit, deterministic
+/// scopes. This mirrors Stage 1's published mapping; it is test
+/// scaffolding, not a second authority — production models always
+/// come from sema.
+pub(crate) fn fixture_block_scopes(
+    parse: &ParseResult,
+    tree: &mut ScopeTree,
+    root: aion_sem_model::ScopeId,
+) -> HashMap<aion_syntax::NodeId, aion_sem_model::ScopeId> {
+    fn go(
+        b: &aion_syntax::Block,
+        bids: &aion_syntax::BlockIds,
+        out: &mut HashMap<aion_syntax::NodeId, aion_sem_model::ScopeId>,
+        tree: &mut ScopeTree,
+        parent: aion_sem_model::ScopeId,
+    ) {
+        let scope = tree.fork(parent).expect("fixture block scope");
+        out.insert(bids.node, scope);
+        for (st, sid) in b.stmts.iter().zip(bids.stmts.iter()) {
+            if let (aion_syntax::Stmt::Block(inner), aion_syntax::StmtIds::Block { body, .. }) =
+                (st, sid)
+            {
+                go(inner, body, out, tree, scope);
+            }
+        }
+    }
+    let mut out = HashMap::new();
+    for (item, iids) in parse.program.items.iter().zip(parse.index.items.iter()) {
+        if let (aion_syntax::Item::Fn(f), aion_syntax::ItemIds::Fn(fids)) = (item, iids) {
+            let function_scope = tree.fork(root).expect("fixture function scope");
+            go(&f.body, &fids.body, &mut out, tree, function_scope);
+        }
+    }
+    out
+}
+
 /// Evaluate a whole parsed program: the value of `main`'s body.
 ///
 /// Walks the AST with the parallel id tables in lockstep (same traversal
@@ -87,6 +130,7 @@ impl Oracle {
 /// semantics mirror the access-authority rule: a `Str` local moves only at
 /// call-argument, `let`-initializer, or trailing-return position; every
 /// other use is a borrow (clone).
+#[allow(clippy::result_large_err)]
 pub(crate) fn eval_program(
     parse: &ParseResult,
     fuel: u64,
@@ -155,6 +199,7 @@ impl Oracle {
         parse.spans.get(id).unwrap_or(ByteSpan::empty(FileId(0), 0))
     }
 
+    #[allow(clippy::result_large_err)]
     fn eval_block(
         &mut self,
         parse: &ParseResult,
@@ -236,6 +281,7 @@ impl Oracle {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::result_large_err)]
     fn eval_expr(
         &mut self,
         parse: &ParseResult,
@@ -421,6 +467,7 @@ impl Oracle {
         merge_sp(self.span_of(parse, l), self.span_of(parse, r))
     }
 
+    #[allow(clippy::result_large_err)]
     fn eval_unary(&self, op: UnOp, v: Value, span: ByteSpan) -> Result<Value, Diagnostic> {
         match (op, v) {
             (UnOp::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
@@ -432,6 +479,7 @@ impl Oracle {
         }
     }
 
+    #[allow(clippy::result_large_err)]
     fn eval_binary(
         &self,
         op: BinOp,
@@ -481,6 +529,7 @@ impl Oracle {
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn oracle_eq(a: &Value, b: &Value, span: ByteSpan) -> Result<bool, Diagnostic> {
     match (a, b) {
         (Value::Int(x), Value::Int(y)) => Ok(x == y),
@@ -634,12 +683,11 @@ mod harness {
     }
 
     /// Hand-built `SemModel`: the scope-tree function signatures the
-    /// lowering pre-pass needs (`name -> Ty::Fn`). Types are fully known
-    /// for every m3 valid fixture (mirrors what sema infers; sema itself
-    /// is not a dependency of this crate).
+    /// lowering pre-pass needs (`name -> Ty::Fn`). Move facts are not
+    /// stored here; `lowered` copies them from semantic analysis.
     fn model_for(sigs: &[(&str, Vec<Ty>, Ty)]) -> aion_sem_model::SemModel {
         let mut tree = ScopeTree::new();
-        let root = tree.root();
+        let root = tree.root().expect("fixture root allocation");
         for (name, params, ret) in sigs {
             tree.define(
                 root,
@@ -670,13 +718,30 @@ mod harness {
         sigs: &[(&str, Vec<Ty>, Ty)],
     ) -> (String, ParseResult, aion_ir::ValidatedModule) {
         let (text, r) = parse_clean(rel);
-        let model = model_for(sigs);
-        let (module, diags) = aion_ir::lower(&r, &model, FileId(0), text.len() as u32);
+        let mut model = model_for(sigs);
+        // Signatures stay hand-built. Block scopes stay the deterministic
+        // test map. Move facts come only from semantic analysis on this
+        // same parse.
+        let root = model
+            .scope_tree
+            .scopes
+            .iter()
+            .position(|s| s.parent.is_none())
+            .map(|i| aion_sem_model::ScopeId(i as u32))
+            .expect("fixture module root");
+        model.block_scopes = super::fixture_block_scopes(&r, &mut model.scope_tree, root);
+        let (sema_diags, sema_model) = aion_sema::check_with_model(&r, FileId(0), text.as_bytes());
         assert!(
-            diags.is_empty(),
-            "{rel} lower must be clean: {:?}",
-            diags.iter().map(|d| d.render_human()).collect::<Vec<_>>()
+            sema_diags.is_empty(),
+            "{rel} sema must be clean: {:?}",
+            sema_diags
+                .iter()
+                .map(|d| d.render_human())
+                .collect::<Vec<_>>()
         );
+        model.moved_uses = sema_model.moved_uses;
+        let module = aion_ir::lower(&r, &model, FileId(0), text.len() as u32)
+            .unwrap_or_else(|diags| panic!("{rel} lower must be clean: {diags:?}"));
         let module = aion_ir::validate(&module).unwrap_or_else(|vdiags| {
             panic!(
                 "{rel} validate must be clean: {:?}",

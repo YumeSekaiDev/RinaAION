@@ -16,11 +16,11 @@
 //! single fact before lowering ever sees it.
 //!
 //! Total: lowering never panics. Structural AST/index mismatches (stale
-//! or adversarial hand-off) yield `AION-E0004` diagnostics; any residual
+//! or adversarial hand-off) yield `AION-E0030` diagnostics; any residual
 //! type variable yields `AION-E0014` and no IR is emitted.
 
 use aion_error::{AssertProvenance, Diagnostic, ErrorCode};
-use aion_sem_model::Ty;
+use aion_sem_model::{ScopeId, ScopeTree, Ty};
 use aion_span::{ByteSpan, FileId};
 use aion_syntax::{
     BinOp, Block, BlockIds, Expr, ExprIds, ExprIdsKind, FnIds, ItemIds, NodeId, ParseResult, Stmt,
@@ -28,6 +28,8 @@ use aion_syntax::{
 };
 use std::collections::{HashMap, HashSet};
 
+pub mod arena;
+pub use arena::{AllocKind, ArenaEntry, ArenaId, ArenaTable};
 pub mod validate;
 pub use validate::{validate, ValidatedModule};
 
@@ -40,18 +42,25 @@ pub use validate::{validate, ValidatedModule};
 pub struct TypedModule {
     pub name: String,
     pub functions: Vec<TypedFn>,
+    /// Module/root scope identity supplied by semantic analysis.
+    pub scope: ScopeId,
     /// Empty span at the end of input, recorded at lowering time for
     /// entry-point diagnostics (SPEC Sec 4: missing `main` points at the
     /// end of input).
     pub eof_span: ByteSpan,
+    /// Per-module arena table. Always empty after Stage 3 lowering:
+    /// arenas are allocated only by future verified transformations.
+    pub arenas: ArenaTable,
 }
 
 impl TypedModule {
-    pub fn new(name: impl Into<String>) -> Self {
+    pub fn new(name: impl Into<String>, scope: ScopeId) -> Self {
         Self {
             name: name.into(),
             functions: Vec::new(),
+            scope,
             eof_span: ByteSpan::empty(FileId(0), 0),
+            arenas: ArenaTable::new(),
         }
     }
 }
@@ -64,6 +73,8 @@ pub type IrModule = TypedModule;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypedFn {
     pub name: String,
+    /// Function parameter scope identity supplied by semantic analysis.
+    pub scope: ScopeId,
     /// Declaration header span (`fn` keyword through the `)` closer),
     /// threaded from the parser index for entry-point diagnostics
     /// (SPEC Sec 4: the offending `main` declaration span).
@@ -77,6 +88,10 @@ pub struct TypedFn {
 pub struct TypedBlock {
     pub stmts: Vec<TypedStmt>,
     pub value: Ty,
+    /// Owning scope from Stage 1's published `block_scopes` map.
+    /// Non-optional: a missing mapping is a fail-closed lowering
+    /// error, never a default or fabricated scope.
+    pub scope: ScopeId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,6 +130,13 @@ pub struct TypedExpr {
     pub ty: Ty,
     pub span: ByteSpan,
     pub kind: ExprKind,
+    /// Allocation provenance: for string expressions, the backing lifetime
+    /// domain; non-string expressions are canonically `Refcounted` under
+    /// normative WF10. Current block-result derivation reads `alloc` on a
+    /// final `Do` expression and uses local binding provenance; the derived
+    /// kind is retained and consumed by provenance diagnostics. Assigned
+    /// explicitly at every construction site; no `Default`.
+    pub alloc: AllocKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,15 +181,17 @@ pub enum LocalAccess {
 /// Lower a clean-sema parse to typed IR.
 ///
 /// `file`/`source_len` locate the end-of-input span recorded on the
-/// module for entry-point diagnostics. Returns the module plus
-/// diagnostics. Any residual `Var` anywhere in the model types yields
-/// `AION-E0014` and NO IR (empty module). Total: never panics.
+/// module for entry-point diagnostics. Returns `Ok(module)` only when
+/// lowering completes without diagnostics. Any lowering error returns
+/// `Err(diagnostics)` and no typed IR; this includes residual `Var`s
+/// (`AION-E0014`) and invalid or inconsistent scope metadata. Total:
+/// never panics.
 pub fn lower(
     parse: &ParseResult,
     model: &aion_sem_model::SemModel,
     file: FileId,
     source_len: u32,
-) -> (TypedModule, Vec<Diagnostic>) {
+) -> Result<TypedModule, Vec<Diagnostic>> {
     let fallback = ByteSpan::empty(FileId(0), 0);
     // Note: first-wins on duplicate fn names iterates scope `symbols`
     // (a HashMap), but duplicates are unreachable on clean programs —
@@ -191,6 +215,11 @@ pub fn lower(
         fns,
         // Sole move authority: the use-site set recorded by sema.
         moved_uses: model.moved_uses.clone(),
+        // Sole scope authority: the published block-to-scope map.
+        block_scopes: model.block_scopes.clone(),
+        scope_parents: model.scope_tree.scopes.iter().map(|s| s.parent).collect(),
+        module_scope: None,
+        claimed_scopes: HashSet::new(),
     };
 
     // E0014 gate first: walk every reachable Ty (model types + every
@@ -232,22 +261,30 @@ pub fn lower(
                 .with_span(sp),
             );
         }
-        let mut empty = TypedModule::new(String::new());
-        empty.eof_span = ByteSpan::empty(file, source_len);
-        return (empty, lx.diags);
+        return Err(lx.diags);
     }
 
-    let mut module = TypedModule::new(String::new());
+    let module_scope = match find_module_scope(&model.scope_tree) {
+        Ok(scope) => scope,
+        Err(message) => {
+            lx.scope_error(message);
+            return Err(lx.diags);
+        }
+    };
+    lx.module_scope = Some(module_scope);
+    lx.claimed_scopes.insert(module_scope);
+
+    let mut module = TypedModule::new(String::new(), module_scope);
     module.eof_span = ByteSpan::empty(file, source_len);
     if parse.program.items.len() != parse.index.items.len() {
         lx.diags.push(
             Diagnostic::new(
-                ErrorCode::ParseError,
+                ErrorCode::InternalIrInvalid,
                 "internal index mismatch: top-level item count differs from index",
             )
             .with_span(fallback),
         );
-        return (module, lx.diags);
+        return Err(lx.diags);
     }
     for (item, iids) in parse.program.items.iter().zip(parse.index.items.iter()) {
         match (item, iids) {
@@ -259,7 +296,7 @@ pub fn lower(
             _ => {
                 lx.diags.push(
                     Diagnostic::new(
-                        ErrorCode::ParseError,
+                        ErrorCode::InternalIrInvalid,
                         "internal index mismatch: item/index kind mismatch",
                     )
                     .with_span(fallback),
@@ -267,7 +304,27 @@ pub fn lower(
             }
         }
     }
-    (module, lx.diags)
+    if lx.diags.is_empty() {
+        Ok(module)
+    } else {
+        Err(lx.diags)
+    }
+}
+
+fn find_module_scope(tree: &ScopeTree) -> Result<ScopeId, String> {
+    let mut root = None;
+    for (index, scope) in tree.scopes.iter().enumerate() {
+        if scope.parent.is_none() {
+            if root.is_some() {
+                return Err("scope tree has multiple parentless module scopes".to_string());
+            }
+            let id = u32::try_from(index)
+                .map(ScopeId)
+                .map_err(|_| "module scope index exceeds ScopeId range".to_string())?;
+            root = Some(id);
+        }
+    }
+    root.ok_or_else(|| "scope tree has no parentless module scope".to_string())
 }
 
 /// True when `ty` (including nested `Fn` params/ret) contains a `Var`.
@@ -294,9 +351,41 @@ struct Lower<'a> {
     /// The recorded sema move facts: a `Local` use is [`LocalAccess::Move`]
     /// iff its use-site [`NodeId`] is in this set, otherwise `Copy`.
     moved_uses: HashSet<NodeId>,
+    /// Published block-to-scope map (Stage 1): block [`NodeId`] to
+    /// owning [`ScopeId`]. Lookups that miss are fail-closed
+    /// `index_mismatch` diagnostics, never default scopes.
+    block_scopes: HashMap<NodeId, ScopeId>,
+    /// Parent links copied from the semantic tree. Used only by lowering
+    /// to verify the identities it attaches to typed IR.
+    scope_parents: Vec<Option<ScopeId>>,
+    module_scope: Option<ScopeId>,
+    claimed_scopes: HashSet<ScopeId>,
 }
 
 impl Lower<'_> {
+    fn scope_error(&mut self, message: impl Into<String>) {
+        self.diags.push(
+            Diagnostic::new(ErrorCode::InternalIrInvalid, message.into()).with_span(self.fallback),
+        );
+    }
+
+    fn scope_parent(&self, scope: ScopeId) -> Option<Option<ScopeId>> {
+        usize::try_from(scope.0)
+            .ok()
+            .and_then(|index| self.scope_parents.get(index).copied())
+    }
+
+    fn claim_scope(&mut self, scope: ScopeId, kind: &str) -> bool {
+        if self.claimed_scopes.insert(scope) {
+            true
+        } else {
+            self.scope_error(format!(
+                "internal scope mismatch: duplicate {kind} scope id"
+            ));
+            false
+        }
+    }
+
     fn span(&mut self, id: NodeId) -> ByteSpan {
         match self.parse.spans.get(id) {
             Some(sp) => sp,
@@ -304,7 +393,7 @@ impl Lower<'_> {
                 let fb = self.fallback;
                 self.diags.push(
                     Diagnostic::new(
-                        ErrorCode::ParseError,
+                        ErrorCode::InternalIrInvalid,
                         "internal index mismatch: missing span for node",
                     )
                     .with_span(fb),
@@ -324,6 +413,51 @@ impl Lower<'_> {
     }
 
     fn lower_fn(&mut self, f: &aion_syntax::FnDecl, fids: &FnIds) -> Option<TypedFn> {
+        let body_scope = match self.block_scopes.get(&fids.body.node).copied() {
+            Some(scope) => scope,
+            None => {
+                self.scope_error("internal scope mismatch: function body scope is missing");
+                return None;
+            }
+        };
+        let function_scope = match self.scope_parent(body_scope) {
+            Some(Some(scope)) => scope,
+            Some(None) => {
+                self.scope_error("internal scope mismatch: function body scope has no parent");
+                return None;
+            }
+            None => {
+                self.scope_error("internal scope mismatch: function body scope id is invalid");
+                return None;
+            }
+        };
+        let module_scope = match self.module_scope {
+            Some(scope) => scope,
+            None => {
+                self.scope_error("internal scope mismatch: module scope is unavailable");
+                return None;
+            }
+        };
+        match self.scope_parent(function_scope) {
+            Some(Some(parent)) if parent == module_scope => {}
+            Some(Some(_)) => {
+                self.scope_error(
+                    "internal scope mismatch: function scope is not under module scope",
+                );
+                return None;
+            }
+            Some(None) => {
+                self.scope_error("internal scope mismatch: function scope has no module parent");
+                return None;
+            }
+            None => {
+                self.scope_error("internal scope mismatch: function scope id is invalid");
+                return None;
+            }
+        }
+        if !self.claim_scope(function_scope, "function") {
+            return None;
+        }
         // Function signature from the scope-tree symbols collected up
         // front (sema mirrors every function there); a missing symbol is
         // hand-off corruption.
@@ -338,7 +472,7 @@ impl Lower<'_> {
             let fb = self.fallback;
             self.diags.push(
                 Diagnostic::new(
-                    ErrorCode::ParseError,
+                    ErrorCode::InternalIrInvalid,
                     format!("internal index mismatch: no scope symbol for `{}`", f.name),
                 )
                 .with_span(fb),
@@ -348,7 +482,7 @@ impl Lower<'_> {
             let fb = self.fallback;
             self.diags.push(
                 Diagnostic::new(
-                    ErrorCode::ParseError,
+                    ErrorCode::InternalIrInvalid,
                     "internal index mismatch: function parameter count differs from index",
                 )
                 .with_span(fb),
@@ -361,7 +495,16 @@ impl Lower<'_> {
                 top.insert(p.clone(), Binding { ty: pt.clone() });
             }
         }
-        let body = self.lower_block(&f.body, &fids.body);
+        let body = match self.lower_block(&f.body, &fids.body, function_scope) {
+            Some(b) => b,
+            // Keep the scope stack balanced even on failure; the
+            // diagnostic is already recorded and the function is
+            // skipped, so no partial IR escapes.
+            None => {
+                self.scopes.pop();
+                return None;
+            }
+        };
         self.scopes.pop();
         // Declared params keep model order even if AST/index were ragged.
         let params: Vec<(String, Ty)> = f
@@ -375,6 +518,7 @@ impl Lower<'_> {
         let decl_span = self.span(fids.decl);
         Some(TypedFn {
             name: f.name.clone(),
+            scope: function_scope,
             decl_span,
             params,
             ret: ret_ty,
@@ -383,21 +527,59 @@ impl Lower<'_> {
     }
 
     /// Lower a block. Move decisions come only from the recorded sema
-    /// set (`moved_uses`); block position plays no role.
-    fn lower_block(&mut self, b: &Block, bids: &BlockIds) -> TypedBlock {
+    /// set (`moved_uses`); block position plays no role. Returns `None`
+    /// when the block cannot be lowered: the diagnostic is already
+    /// recorded and the failed function must not produce partial IR.
+    fn lower_block(
+        &mut self,
+        b: &Block,
+        bids: &BlockIds,
+        expected_parent: ScopeId,
+    ) -> Option<TypedBlock> {
+        // Stage 3: fail closed on a missing scope mapping. Never
+        // fabricate or substitute a default scope.
+        let scope = match self.block_scopes.get(&bids.node) {
+            Some(s) => *s,
+            None => {
+                let fb = self.fallback;
+                self.diags.push(
+                    Diagnostic::new(
+                        ErrorCode::InternalIrInvalid,
+                        "internal index mismatch: block scope missing for block",
+                    )
+                    .with_span(fb),
+                );
+                return None;
+            }
+        };
+        match self.scope_parent(scope) {
+            Some(Some(parent)) if parent == expected_parent => {}
+            Some(Some(_)) => {
+                self.scope_error("internal scope mismatch: block scope has an inconsistent parent");
+                return None;
+            }
+            Some(None) => {
+                self.scope_error("internal scope mismatch: block scope has no parent");
+                return None;
+            }
+            None => {
+                self.scope_error("internal scope mismatch: block scope id is invalid");
+                return None;
+            }
+        }
+        if !self.claim_scope(scope, "block") {
+            return None;
+        }
         if b.stmts.len() != bids.stmts.len() {
             let fb = self.fallback;
             self.diags.push(
                 Diagnostic::new(
-                    ErrorCode::ParseError,
+                    ErrorCode::InternalIrInvalid,
                     "internal index mismatch: block statement count differs from index",
                 )
                 .with_span(fb),
             );
-            return TypedBlock {
-                stmts: Vec::new(),
-                value: Ty::Unit,
-            };
+            return None;
         }
         self.scopes.push(HashMap::new());
         let n = b.stmts.len();
@@ -452,8 +634,16 @@ impl Lower<'_> {
                     },
                 ) => {
                     // Nested blocks recurse: value is the inner trailing
-                    // `do` type, else `Unit`.
-                    let tb = self.lower_block(inner, inner_ids);
+                    // `do` type, else `Unit`. A failed nested block fails
+                    // the enclosing block (keeping the scope stack
+                    // balanced): no partial IR escapes.
+                    let tb = match self.lower_block(inner, inner_ids, scope) {
+                        Some(tb) => tb,
+                        None => {
+                            self.scopes.pop();
+                            return None;
+                        }
+                    };
                     if trailing {
                         value = tb.value.clone();
                     }
@@ -500,7 +690,7 @@ impl Lower<'_> {
                     let fb = self.fallback;
                     self.diags.push(
                         Diagnostic::new(
-                            ErrorCode::ParseError,
+                            ErrorCode::InternalIrInvalid,
                             "internal index mismatch: statement/index kind mismatch",
                         )
                         .with_span(fb),
@@ -509,7 +699,11 @@ impl Lower<'_> {
             }
         }
         self.scopes.pop();
-        TypedBlock { stmts, value }
+        Some(TypedBlock {
+            stmts,
+            value,
+            scope,
+        })
     }
 
     /// Lower an expression. A `Local` use is [`LocalAccess::Move`] iff
@@ -523,21 +717,30 @@ impl Lower<'_> {
                 ty: Ty::Int,
                 span: node_sp,
                 kind: ExprKind::Int(*v),
+                // Lowering assigns canonical Refcounted; derivation reads this field.
+                alloc: AllocKind::Refcounted,
             },
             Expr::Str(s) => TypedExpr {
                 ty: Ty::Str,
                 span: node_sp,
                 kind: ExprKind::Str(s.clone()),
+                // Stage 3 allocates no arenas: every string-typed node
+                // is explicitly refcounted.
+                alloc: AllocKind::Refcounted,
             },
             Expr::Bool(v) => TypedExpr {
                 ty: Ty::Bool,
                 span: node_sp,
                 kind: ExprKind::Bool(*v),
+                // Lowering assigns canonical Refcounted; derivation reads this field.
+                alloc: AllocKind::Refcounted,
             },
             Expr::Null => TypedExpr {
                 ty: Ty::Null,
                 span: node_sp,
                 kind: ExprKind::Null,
+                // Lowering assigns canonical Refcounted; derivation reads this field.
+                alloc: AllocKind::Refcounted,
             },
             Expr::Ident(name) => {
                 if name == "null" {
@@ -546,6 +749,8 @@ impl Lower<'_> {
                         ty: Ty::Null,
                         span: node_sp,
                         kind: ExprKind::Null,
+                        // Lowering assigns canonical Refcounted; derivation reads this field.
+                        alloc: AllocKind::Refcounted,
                     };
                 }
                 match self.lookup(name) {
@@ -553,7 +758,7 @@ impl Lower<'_> {
                         let fb = self.fallback;
                         self.diags.push(
                             Diagnostic::new(
-                                ErrorCode::ParseError,
+                                ErrorCode::InternalIrInvalid,
                                 format!("internal index mismatch: unbound name `{name}`"),
                             )
                             .with_span(fb),
@@ -565,6 +770,8 @@ impl Lower<'_> {
                                 name: name.clone(),
                                 access: LocalAccess::Copy,
                             },
+                            // Lowering assigns canonical Refcounted; local reads derive from bindings.
+                            alloc: AllocKind::Refcounted,
                         }
                     }
                     Some(b) => {
@@ -580,6 +787,8 @@ impl Lower<'_> {
                                 name: name.clone(),
                                 access,
                             },
+                            // Lowering assigns canonical Refcounted; local reads derive from bindings.
+                            alloc: AllocKind::Refcounted,
                         }
                     }
                 }
@@ -591,7 +800,7 @@ impl Lower<'_> {
                         let fb = self.fallback;
                         self.diags.push(
                             Diagnostic::new(
-                                ErrorCode::ParseError,
+                                ErrorCode::InternalIrInvalid,
                                 "internal index mismatch: unary/index kind mismatch",
                             )
                             .with_span(fb),
@@ -633,6 +842,8 @@ impl Lower<'_> {
                         op: *op,
                         rhs: Box::new(r),
                     },
+                    // Lowering assigns canonical Refcounted; derivation reads this field.
+                    alloc: AllocKind::Refcounted,
                 }
             }
             Expr::Binary { op, lhs, rhs } => {
@@ -642,7 +853,7 @@ impl Lower<'_> {
                         let fb = self.fallback;
                         self.diags.push(
                             Diagnostic::new(
-                                ErrorCode::ParseError,
+                                ErrorCode::InternalIrInvalid,
                                 "internal index mismatch: binary/index kind mismatch",
                             )
                             .with_span(fb),
@@ -671,6 +882,8 @@ impl Lower<'_> {
                         lhs: Box::new(l),
                         rhs: Box::new(r),
                     },
+                    // Lowering assigns canonical Refcounted; derivation reads this field.
+                    alloc: AllocKind::Refcounted,
                 }
             }
             Expr::Call { callee, args } => {
@@ -684,7 +897,7 @@ impl Lower<'_> {
                         let fb = self.fallback;
                         self.diags.push(
                             Diagnostic::new(
-                                ErrorCode::ParseError,
+                                ErrorCode::InternalIrInvalid,
                                 "internal index mismatch: call/index kind mismatch",
                             )
                             .with_span(fb),
@@ -699,7 +912,7 @@ impl Lower<'_> {
                     let fb = self.fallback;
                     self.diags.push(
                         Diagnostic::new(
-                            ErrorCode::ParseError,
+                            ErrorCode::InternalIrInvalid,
                             "internal index mismatch: call argument count differs from index",
                         )
                         .with_span(fb),
@@ -721,6 +934,8 @@ impl Lower<'_> {
                         callee: callee.clone(),
                         args: lowered,
                     },
+                    // Lowering assigns canonical Refcounted; derivation reads this field.
+                    alloc: AllocKind::Refcounted,
                 }
             }
         }

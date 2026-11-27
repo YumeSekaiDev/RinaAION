@@ -13,7 +13,8 @@
 
 use aion_error::{Diagnostic, ErrorCode};
 use aion_sem_model::{
-    GoalEntry, GoalRef, IntentEntry, ScopeId, ScopeTree, Symbol, SymbolKind, Ty as PubTy,
+    GoalEntry, GoalRef, IntentEntry, ScopeId, ScopeTree, ScopeTreeError, Symbol, SymbolKind,
+    Ty as PubTy,
 };
 use aion_span::ByteSpan;
 use aion_syntax::{
@@ -84,6 +85,20 @@ struct Bind {
 struct FnSig {
     param_vars: Vec<Ity>,
     ret_var: Ity,
+}
+
+/// Home of a function-body trailing identifier, classified by live scope
+/// depth before that body frame is popped.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TrailingOwner {
+    /// Innermost frame: a `let` of the function body.
+    Body,
+    /// The frame immediately outside the body: the function parameters.
+    Parameter,
+    /// Any further frame, including the module root of function names.
+    Root,
+    /// No trailing identifier, or the name is not bound.
+    None,
 }
 
 struct Checker<'p> {
@@ -303,7 +318,7 @@ impl<'p> Checker<'p> {
     fn index_mismatch(&mut self, what: &str) {
         self.diags.push(
             Diagnostic::new(
-                ErrorCode::ParseError,
+                ErrorCode::InternalIrInvalid,
                 format!("internal index mismatch: {what}"),
             )
             .with_span(self.fallback),
@@ -352,11 +367,21 @@ impl<'p> Checker<'p> {
         &mut self.bindings[n]
     }
 
-    fn push_scope(&mut self, parent: ScopeId) -> ScopeId {
-        let id = self.tree.fork(parent);
+    fn push_scope(&mut self, parent: ScopeId) -> Result<ScopeId, ScopeTreeError> {
+        let id = self.tree.fork(parent)?;
         self.scope_ids.push(id);
         self.bindings.push(HashMap::new());
-        id
+        Ok(id)
+    }
+
+    fn scope_allocation_failed(&mut self, error: ScopeTreeError) {
+        self.diags.push(
+            Diagnostic::new(
+                ErrorCode::InternalIrInvalid,
+                format!("internal scope allocation failed: {error:?}"),
+            )
+            .with_span(self.fallback),
+        );
     }
 
     fn pop_scope(&mut self) {
@@ -812,25 +837,58 @@ impl<'p> Checker<'p> {
         }
     }
 
+    /// Classify `name` while the function-body frame is still innermost.
+    /// A body local is recorded only when it is unmoved and not a copy
+    /// type. The binding itself is left unchanged: the frame is about to
+    /// pop, and an ineligible body local must not fall through to the
+    /// parameter path.
+    fn classify_trailing(&mut self, name: &str, use_site: NodeId) -> TrailingOwner {
+        let body_depth = self.bindings.len().saturating_sub(1);
+        match self.lookup(name) {
+            Some((depth, b)) if depth == body_depth => {
+                if !b.moved && !self.is_copy(&b.ty) {
+                    self.move_sites.push((use_site, b.ty.clone()));
+                }
+                TrailingOwner::Body
+            }
+            Some((depth, _)) if depth + 1 == body_depth => TrailingOwner::Parameter,
+            Some(_) => TrailingOwner::Root,
+            None => TrailingOwner::None,
+        }
+    }
+
     /// Check a block in a fresh child scope. Value = type of the
     /// trailing `do` expression, else `Unit`. The trailing value (if any)
     /// is also returned as `(name, use_span, use_site)` when it is a bare
-    /// identifier, so the caller can apply return-move semantics (SPEC
-    /// Sec 3). `use_site` is the trailing identifier's [`NodeId`].
+    /// identifier. `use_site` is the trailing identifier's [`NodeId`].
+    ///
+    /// `fn_body` classifies that identifier before the pop. Nested blocks
+    /// pass `false` and always return [`TrailingOwner::None`].
     fn check_block(
         &mut self,
         b: &Block,
         bids: &BlockIds,
-    ) -> (Ity, Option<(String, ByteSpan, NodeId)>) {
-        let parent = *self.scope_ids.last().unwrap_or(&ScopeId(0));
-        let scope = self.push_scope(parent);
+        fn_body: bool,
+    ) -> (Ity, Option<(String, ByteSpan, NodeId)>, TrailingOwner) {
+        let Some(parent) = self.scope_ids.last().copied() else {
+            self.index_mismatch("scope stack missing parent while entering block");
+            return (Ity::Error, None, TrailingOwner::None);
+        };
+        let scope = match self.push_scope(parent) {
+            Ok(scope) => scope,
+            Err(error) => {
+                self.scope_allocation_failed(error);
+                return (Ity::Error, None, TrailingOwner::None);
+            }
+        };
         self.block_scopes.insert(bids.node, scope);
         let mut value = Ity::Unit;
         let mut trailing: Option<(String, ByteSpan, NodeId)> = None;
         let n = b.stmts.len();
         if n != bids.stmts.len() {
             self.index_mismatch("block statement count differs from index");
-            return (Ity::Error, None);
+            self.pop_scope();
+            return (Ity::Error, None, TrailingOwner::None);
         }
         for (i, (st, sid)) in b.stmts.iter().zip(bids.stmts.iter()).enumerate() {
             match (st, sid) {
@@ -886,7 +944,7 @@ impl<'p> Checker<'p> {
                     }
                 }
                 (Stmt::Block(b), StmtIds::Block { node, body: bids }) => {
-                    let (t, _) = self.check_block(b, bids);
+                    let (t, _, _) = self.check_block(b, bids, false);
                     self.expr_tys.insert(*node, t.clone());
                     if i + 1 == n {
                         value = t;
@@ -958,8 +1016,16 @@ impl<'p> Checker<'p> {
         }
         let _ = n;
         self.expr_tys.insert(bids.node, value.clone());
+        let owner = if fn_body {
+            match &trailing {
+                Some((nm, _, use_site)) => self.classify_trailing(nm, *use_site),
+                None => TrailingOwner::None,
+            }
+        } else {
+            TrailingOwner::None
+        };
         self.pop_scope();
-        (value, trailing)
+        (value, trailing, owner)
     }
 
     fn check_fn(&mut self, f: &aion_syntax::FnDecl, fids: &FnIds, global: ScopeId) {
@@ -989,7 +1055,13 @@ impl<'p> Checker<'p> {
             None => (vec![], self.fresh_var()),
         };
 
-        let scope = self.push_scope(global);
+        let scope = match self.push_scope(global) {
+            Ok(scope) => scope,
+            Err(error) => {
+                self.scope_allocation_failed(error);
+                return;
+            }
+        };
         if f.params.len() != fids.params.len() {
             self.index_mismatch("function parameter count differs from index");
             self.pop_scope();
@@ -1026,23 +1098,14 @@ impl<'p> Checker<'p> {
             self.mirror(scope, p, &bind);
         }
 
-        let (body_ty, trailing) = self.check_block(&f.body, &fids.body);
-        // Return-move (SPEC Sec 3): a `Str`-typed block value is owned by
-        // the caller on return. Returning a local owned `Str` transfers it
-        // and returning a `Str` parameter moves it; the source binding is
-        // marked moved at the trailing use site. `Copy` returns never move.
-        if let Some((nm, use_span, use_site)) = trailing {
-            if !self.is_copy(&body_ty) {
-                // The block scope already popped, so a block-local
-                // trailing value has no live binding to mark (parameters
-                // still do). The use-site moves either way — this is the
-                // historical return-move decision — so record it even
-                // when no binding is marked. Already-moved bindings stay
-                // unrecorded (repeat consumes only diagnose).
-                let live = self.lookup(&nm).is_some();
-                self.mark_moved(&nm, use_span, use_site, body_ty.clone());
-                if !live {
-                    self.move_sites.push((use_site, body_ty.clone()));
+        let (body_ty, trailing, owner) = self.check_block(&f.body, &fids.body, true);
+        // Parameter returns move after the body frame pops. Body locals
+        // were recorded before that pop. Root names and misses record
+        // nothing, and an ineligible body local does not fall through.
+        if owner == TrailingOwner::Parameter {
+            if let Some((nm, use_span, use_site)) = trailing {
+                if !self.is_copy(&body_ty) {
+                    self.mark_moved(&nm, use_span, use_site, body_ty.clone());
                 }
             }
         }
@@ -1110,6 +1173,7 @@ pub fn check_with_model(
     model.intents = out.intents;
     model.intents_by_owner = intents_by_owner;
     model.orphans = orphans;
+    model.block_scopes = out.block_scopes;
     (out.diags, model)
 }
 
@@ -1189,9 +1253,64 @@ struct CleanOutput {
     items: Vec<aion_sem_model::Item>,
     types: HashMap<NodeId, PubTy>,
     intents: Vec<IntentEntry>,
+    block_scopes: HashMap<NodeId, ScopeId>,
 }
 
-fn check_clean(parse: &ParseResult, file: aion_span::FileId, _bytes: &[u8]) -> CleanOutput {
+/// Collect every block node reachable from function bodies, recursing
+/// nested `Stmt::Block`s. Intent bodies are excluded: the statement
+/// checker never enters them, so they need no scope entry.
+fn reachable_block_nodes(parse: &ParseResult, out: &mut Vec<NodeId>) {
+    fn block(b: &Block, bids: &BlockIds, out: &mut Vec<NodeId>) {
+        out.push(bids.node);
+        for (st, sid) in b.stmts.iter().zip(bids.stmts.iter()) {
+            if let (Stmt::Block(inner), StmtIds::Block { body, .. }) = (st, sid) {
+                block(inner, body, out);
+            }
+        }
+    }
+    for (item, iids) in parse.program.items.iter().zip(parse.index.items.iter()) {
+        if let (aion_syntax::Item::Fn(f), ItemIds::Fn(fids)) = (item, iids) {
+            block(&f.body, &fids.body, out);
+        }
+    }
+}
+
+/// Fail-closed completeness check for the published block-to-scope
+/// map: when analysis is otherwise clean, every reachable block must
+/// have a scope entry. Dirty results may stay partial because the
+/// driver never lowers them. Returns the internal diagnostic on
+/// violation, `None` when complete.
+fn verify_block_scopes(
+    parse: &ParseResult,
+    scopes: &HashMap<NodeId, ScopeId>,
+    fallback: ByteSpan,
+) -> Option<Diagnostic> {
+    let mut nodes = Vec::new();
+    reachable_block_nodes(parse, &mut nodes);
+    let missing = nodes.iter().filter(|id| !scopes.contains_key(id)).count();
+    if missing == 0 {
+        None
+    } else {
+        Some(
+            Diagnostic::new(
+                ErrorCode::InternalIrInvalid,
+                format!("internal index mismatch: block scope missing for {missing} block(s)"),
+            )
+            .with_span(fallback),
+        )
+    }
+}
+
+fn check_clean(parse: &ParseResult, file: aion_span::FileId, bytes: &[u8]) -> CleanOutput {
+    check_clean_with_max_scope_id(parse, file, bytes, u32::MAX)
+}
+
+fn check_clean_with_max_scope_id(
+    parse: &ParseResult,
+    file: aion_span::FileId,
+    _bytes: &[u8],
+    max_scope_id: u32,
+) -> CleanOutput {
     let _ = file;
     let fallback = aion_span::ByteSpan::empty(file, 0);
     // Pre-pass: one fresh variable per parameter and return slot, so
@@ -1200,7 +1319,7 @@ fn check_clean(parse: &ParseResult, file: aion_span::FileId, _bytes: &[u8]) -> C
         spans: &parse.spans,
         fallback,
         diags: Vec::new(),
-        tree: ScopeTree::new(),
+        tree: ScopeTree::with_max_id(max_scope_id),
         scope_ids: Vec::new(),
         bindings: Vec::new(),
         subst: Vec::new(),
@@ -1224,6 +1343,10 @@ fn check_clean(parse: &ParseResult, file: aion_span::FileId, _bytes: &[u8]) -> C
             items: Vec::new(),
             types: HashMap::new(),
             intents: Vec::new(),
+            // Dirty result: diags are non-empty, so the driver never
+            // lowers this model; the empty map is never accepted as
+            // complete (verification only passes clean results).
+            block_scopes: HashMap::new(),
         };
     }
     for item in &parse.program.items {
@@ -1242,7 +1365,21 @@ fn check_clean(parse: &ParseResult, file: aion_span::FileId, _bytes: &[u8]) -> C
         }
     }
 
-    let global = ck.tree.root();
+    let global = match ck.tree.root() {
+        Ok(global) => global,
+        Err(error) => {
+            ck.scope_allocation_failed(error);
+            return CleanOutput {
+                diags: ck.diags,
+                tree: ck.tree,
+                moved_uses: HashSet::new(),
+                items: Vec::new(),
+                types: HashMap::new(),
+                intents: Vec::new(),
+                block_scopes: HashMap::new(),
+            };
+        }
+    };
     ck.scope_ids.push(global);
     ck.bindings.push(HashMap::new());
     // Publish every function name up front so calls resolve regardless
@@ -1362,6 +1499,16 @@ fn check_clean(parse: &ParseResult, file: aion_span::FileId, _bytes: &[u8]) -> C
             });
         }
     }
+    // Stage 1 completeness: a clean result must carry a complete
+    // block-to-scope map. Missing entries fail closed here; dirty
+    // results stay partial and never reach lowering.
+    if ck.diags.is_empty() {
+        let fallback = ck.fallback;
+        if let Some(d) = verify_block_scopes(parse, &ck.block_scopes, fallback) {
+            ck.diags.push(d);
+        }
+    }
+    let block_scopes = std::mem::take(&mut ck.block_scopes);
     CleanOutput {
         diags: ck.diags,
         tree: ck.tree,
@@ -1369,5 +1516,391 @@ fn check_clean(parse: &ParseResult, file: aion_span::FileId, _bytes: &[u8]) -> C
         items,
         types,
         intents,
+        block_scopes,
+    }
+}
+
+#[cfg(test)]
+mod stage1_tests {
+    use super::*;
+    use aion_span::FileId;
+
+    fn parsed(src: &str) -> ParseResult {
+        let r = aion_syntax::parse(FileId(0), src.as_bytes());
+        assert!(
+            r.errors.is_empty(),
+            "fixture must parse clean: {src:?}: {:?}",
+            r.errors
+                .iter()
+                .map(|d| d.render_human())
+                .collect::<Vec<_>>()
+        );
+        r
+    }
+
+    #[test]
+    fn complete_map_passes_verification() {
+        let parse = parsed("fn main() { let a = 1; { do a; } do a; }");
+        let (diags, model) = crate::check_with_model(
+            &parse,
+            FileId(0),
+            b"fn main() { let a = 1; { do a; } do a; }",
+        );
+        assert!(diags.is_empty(), "expected clean sema: {diags:?}");
+        let fallback = ByteSpan::empty(FileId(0), 0);
+        assert!(
+            verify_block_scopes(&parse, &model.block_scopes, fallback).is_none(),
+            "complete map must verify clean"
+        );
+    }
+
+    #[test]
+    fn function_scope_exhaustion_is_reported_and_not_published_clean() {
+        let src = "fn main() { do 1; }";
+        let parse = parsed(src);
+        // Root gets ID 0; the function parameter scope then exhausts the
+        // bounded allocator before either checker stack is pushed.
+        let out = check_clean_with_max_scope_id(&parse, FileId(0), src.as_bytes(), 0);
+        assert!(
+            out.diags.iter().any(|d| {
+                d.code == ErrorCode::InternalIrInvalid
+                    && d.message == "internal scope allocation failed: IdExhausted"
+            }),
+            "expected allocation diagnostic, got {:?}",
+            out.diags
+        );
+        assert_eq!(
+            out.tree.scopes.len(),
+            1,
+            "failed allocation must not append"
+        );
+        assert!(out.block_scopes.is_empty());
+    }
+
+    #[test]
+    fn nested_scope_exhaustion_preserves_enclosing_binding_and_stack() {
+        let src = "fn main() { let x = 1; { do x; } do x; }";
+        let parse = parsed(src);
+        // Root, parameter frame, and function body consume IDs 0..=2;
+        // the nested block allocation fails without disturbing the body.
+        let out = check_clean_with_max_scope_id(&parse, FileId(0), src.as_bytes(), 2);
+        assert!(
+            out.diags.iter().any(|d| {
+                d.code == ErrorCode::InternalIrInvalid
+                    && d.message == "internal scope allocation failed: IdExhausted"
+            }),
+            "expected allocation diagnostic, got {:?}",
+            out.diags
+        );
+        assert!(
+            out.diags
+                .iter()
+                .all(|d| { d.code != ErrorCode::UnboundName || !d.message.contains("`x`") }),
+            "failed child allocation corrupted the enclosing binding stack: {:?}",
+            out.diags
+        );
+        assert_eq!(
+            out.tree.scopes.len(),
+            3,
+            "failed allocation must not append"
+        );
+        assert_eq!(
+            out.block_scopes.len(),
+            1,
+            "only the entered body is published"
+        );
+        assert!(!out.diags.is_empty(), "partial analysis must not be clean");
+    }
+
+    #[test]
+    fn synthetic_missing_entry_fails_closed() {
+        let parse = parsed("fn main() { let a = 1; { do a; } do a; }");
+        let (diags, mut model) = crate::check_with_model(
+            &parse,
+            FileId(0),
+            b"fn main() { let a = 1; { do a; } do a; }",
+        );
+        assert!(diags.is_empty(), "expected clean sema: {diags:?}");
+        assert!(
+            !model.block_scopes.is_empty(),
+            "expected published scope entries"
+        );
+        let removed = *model
+            .block_scopes
+            .keys()
+            .next()
+            .expect("at least one entry");
+        model.block_scopes.remove(&removed);
+        let fallback = ByteSpan::empty(FileId(0), 0);
+        let d = verify_block_scopes(&parse, &model.block_scopes, fallback)
+            .expect("missing entry must fail closed");
+        assert_eq!(d.code, ErrorCode::InternalIrInvalid);
+        assert_eq!(d.code.code_str(), "AION-E0030");
+        assert!(
+            d.message.contains("block scope missing"),
+            "unexpected message: {}",
+            d.message
+        );
+    }
+
+    #[test]
+    fn block_count_mismatch_pops_scope_before_next_function() {
+        // A nested block whose index is shorter than its AST must emit
+        // E0030 and pop the scope `check_block` just pushed. Otherwise
+        // the failed function's parameter frame stays live and the next
+        // function resolves that name.
+        let src = "fn bad(hidden) { let kept = 1; { do kept; } } \
+                   fn main() { let x = 1; do x; do hidden; do kept; }";
+        let mut parse = parsed(src);
+        let ItemIds::Fn(fids) = &mut parse.index.items[0] else {
+            panic!("bad");
+        };
+        let StmtIds::Block { body, .. } = &mut fids.body.stmts[1] else {
+            panic!("nested block");
+        };
+        body.stmts.clear();
+        let (diags, _) = crate::check_with_model(&parse, FileId(0), src.as_bytes());
+        assert!(
+            diags.iter().any(|d| {
+                d.code == ErrorCode::InternalIrInvalid
+                    && d.code.code_str() == "AION-E0030"
+                    && d.message
+                        == "internal index mismatch: block statement count differs from index"
+            }),
+            "expected E0030 count mismatch, got {diags:?}"
+        );
+        assert!(
+            diags.iter().any(|d| {
+                d.code == ErrorCode::UnboundName && d.message.contains("unbound name `hidden`")
+            }),
+            "parameter binding leaked into main: {diags:?}"
+        );
+        assert!(
+            diags.iter().any(|d| {
+                d.code == ErrorCode::UnboundName && d.message.contains("unbound name `kept`")
+            }),
+            "local binding leaked into main: {diags:?}"
+        );
+        assert!(
+            diags
+                .iter()
+                .all(|d| !d.message.contains("unbound name `x`")),
+            "main's own binding was lost: {diags:?}"
+        );
+    }
+
+    /// Scope id published for `body`, and the scope directly above it.
+    fn body_and_param(model: &aion_sem_model::SemModel, body: NodeId) -> (ScopeId, ScopeId) {
+        let body_scope = model.block_scopes[&body];
+        let param = model
+            .scope_tree
+            .scopes
+            .get(body_scope.0 as usize)
+            .and_then(|s| s.parent)
+            .expect("function body scope must sit in the tree under a parent");
+        (body_scope, param)
+    }
+
+    /// The parameter frame of a function body must be parented by the
+    /// root scope. An unpopped frame from an earlier function becomes
+    /// that parent instead.
+    fn assert_param_under_root(model: &aion_sem_model::SemModel, body: NodeId) {
+        let (_body_scope, param) = body_and_param(model, body);
+        let above = model
+            .scope_tree
+            .scopes
+            .get(param.0 as usize)
+            .and_then(|s| s.parent)
+            .expect("parameter scope must have a parent");
+        let root = model
+            .scope_tree
+            .scopes
+            .get(above.0 as usize)
+            .expect("parameter parent must exist in the tree");
+        assert!(
+            root.parent.is_none(),
+            "scope stack leaked a frame under the next function: parent of {param:?} is {above:?}"
+        );
+    }
+
+    #[test]
+    fn published_scopes_match_block_hierarchy() {
+        // One function body, a nested block inside the first sibling,
+        // and a second sibling. Each published id must exist, be unique,
+        // and parent to the enclosing block (the body parents to the
+        // parameter frame, which parents to the root).
+        let src = "fn main(p) { let a = 1; { let b = 2; { do b; } } { do a; } do p; }";
+        let parse = parsed(src);
+        let (diags, model) = crate::check_with_model(&parse, FileId(0), src.as_bytes());
+        assert!(diags.is_empty(), "expected clean sema: {diags:?}");
+
+        fn walk(
+            b: &Block,
+            bids: &BlockIds,
+            parent: Option<NodeId>,
+            out: &mut Vec<(NodeId, Option<NodeId>)>,
+        ) {
+            out.push((bids.node, parent));
+            for (st, sid) in b.stmts.iter().zip(bids.stmts.iter()) {
+                if let (Stmt::Block(inner), StmtIds::Block { body, .. }) = (st, sid) {
+                    walk(inner, body, Some(bids.node), out);
+                }
+            }
+        }
+
+        let mut nodes = Vec::new();
+        for (item, iids) in parse.program.items.iter().zip(parse.index.items.iter()) {
+            if let (aion_syntax::Item::Fn(f), ItemIds::Fn(fids)) = (item, iids) {
+                walk(&f.body, &fids.body, None, &mut nodes);
+            }
+        }
+        assert_eq!(nodes.len(), 4, "body, sibling, nested, sibling");
+        assert_eq!(
+            model.block_scopes.len(),
+            nodes.len(),
+            "published map has orphan or missing entries: {:?}",
+            model.block_scopes
+        );
+
+        let mut seen = HashSet::new();
+        for (node, parent_block) in &nodes {
+            let scope = *model
+                .block_scopes
+                .get(node)
+                .unwrap_or_else(|| panic!("missing scope for {node:?}"));
+            assert!(
+                seen.insert(scope),
+                "scope {scope:?} published for more than one block"
+            );
+            let rec = model
+                .scope_tree
+                .scopes
+                .get(scope.0 as usize)
+                .unwrap_or_else(|| panic!("published {scope:?} is not in the scope tree"));
+            match parent_block {
+                Some(parent) => {
+                    let parent_scope = model.block_scopes[parent];
+                    assert_eq!(
+                        rec.parent,
+                        Some(parent_scope),
+                        "block {node:?} parent does not match the enclosing block"
+                    );
+                }
+                None => {
+                    assert_param_under_root(&model, *node);
+                }
+            }
+        }
+
+        let (_body, param) = body_and_param(&model, nodes[0].0);
+        let sib = model.block_scopes[&nodes[1].0];
+        let nested = model.block_scopes[&nodes[2].0];
+        let sib2 = model.block_scopes[&nodes[3].0];
+        assert!(model.scope_tree.scopes[param.0 as usize]
+            .symbols
+            .contains_key("p"));
+        assert!(
+            model.scope_tree.scopes[model.block_scopes[&nodes[0].0].0 as usize]
+                .symbols
+                .contains_key("a")
+        );
+        assert!(model.scope_tree.scopes[sib.0 as usize]
+            .symbols
+            .contains_key("b"));
+        assert!(
+            !model.scope_tree.scopes[nested.0 as usize]
+                .symbols
+                .contains_key("b"),
+            "nested block must not own the enclosing let"
+        );
+        assert!(
+            !model.scope_tree.scopes[sib2.0 as usize]
+                .symbols
+                .contains_key("a"),
+            "sibling block must not own the function-body let"
+        );
+    }
+
+    #[test]
+    fn param_count_mismatch_pops_scope_before_next_function() {
+        let src = "fn bad(hidden) { do 1; } \
+                   fn main() { let x = 1; do x; do hidden; }";
+        let mut parse = parsed(src);
+        let ItemIds::Fn(fids) = &mut parse.index.items[0] else {
+            panic!("bad");
+        };
+        fids.params.clear();
+        let (diags, model) = crate::check_with_model(&parse, FileId(0), src.as_bytes());
+        assert!(
+            diags.iter().any(|d| {
+                d.code == ErrorCode::InternalIrInvalid
+                    && d.code.code_str() == "AION-E0030"
+                    && d.message
+                        == "internal index mismatch: function parameter count differs from index"
+            }),
+            "expected E0030 parameter mismatch, got {diags:?}"
+        );
+        assert!(
+            diags.iter().any(|d| {
+                d.code == ErrorCode::UnboundName && d.message.contains("unbound name `hidden`")
+            }),
+            "parameter binding leaked into main: {diags:?}"
+        );
+        assert!(
+            diags
+                .iter()
+                .all(|d| !d.message.contains("unbound name `x`")),
+            "main's own binding was lost: {diags:?}"
+        );
+        let ItemIds::Fn(main_ids) = &parse.index.items[1] else {
+            panic!("main");
+        };
+        assert_param_under_root(&model, main_ids.body.node);
+    }
+
+    #[test]
+    fn statement_kind_mismatch_keeps_scope_stack() {
+        let src = "fn bad(hidden) { let kept = 1; { do kept; } } \
+                   fn main() { let x = 1; do x; do hidden; do kept; }";
+        let mut parse = parsed(src);
+        let ItemIds::Fn(fids) = &mut parse.index.items[0] else {
+            panic!("bad");
+        };
+        let node = match &fids.body.stmts[1] {
+            StmtIds::Block { node, .. } => *node,
+            _ => panic!("nested block"),
+        };
+        fids.body.stmts[1] = StmtIds::Empty(node);
+        let (diags, model) = crate::check_with_model(&parse, FileId(0), src.as_bytes());
+        assert!(
+            diags.iter().any(|d| {
+                d.code == ErrorCode::InternalIrInvalid
+                    && d.code.code_str() == "AION-E0030"
+                    && d.message == "internal index mismatch: statement/index kind mismatch"
+            }),
+            "expected E0030 kind mismatch, got {diags:?}"
+        );
+        assert!(
+            diags.iter().any(|d| {
+                d.code == ErrorCode::UnboundName && d.message.contains("unbound name `hidden`")
+            }),
+            "parameter binding leaked into main: {diags:?}"
+        );
+        assert!(
+            diags.iter().any(|d| {
+                d.code == ErrorCode::UnboundName && d.message.contains("unbound name `kept`")
+            }),
+            "local binding leaked into main: {diags:?}"
+        );
+        assert!(
+            diags
+                .iter()
+                .all(|d| !d.message.contains("unbound name `x`")),
+            "main's own binding was lost: {diags:?}"
+        );
+        let ItemIds::Fn(main_ids) = &parse.index.items[1] else {
+            panic!("main");
+        };
+        assert_param_under_root(&model, main_ids.body.node);
     }
 }

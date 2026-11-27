@@ -51,15 +51,8 @@ fn enabled_module(rel: &str) -> (String, aion_ir::ValidatedModule) {
             .map(|d| d.render_human())
             .collect::<Vec<_>>()
     );
-    let (module, lower_diags) = aion_ir::lower(&parse, &model, fid(), text.len() as u32);
-    assert!(
-        lower_diags.is_empty(),
-        "{rel} must lower clean: {:?}",
-        lower_diags
-            .iter()
-            .map(|d| d.render_human())
-            .collect::<Vec<_>>()
-    );
+    let module = aion_ir::lower(&parse, &model, fid(), text.len() as u32)
+        .unwrap_or_else(|lower_diags| panic!("{rel} must lower clean: {lower_diags:?}"));
     let validated = aion_ir::validate(&module).unwrap_or_else(|ds| {
         panic!(
             "{rel} must validate clean: {:?}",

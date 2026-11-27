@@ -50,7 +50,7 @@ pub enum ErrorCode {
     UnresolvedType = 14,
     /// Use after move.
     UseAfterMove = 20,
-    /// Internal IR invariant violation (M3.3 validator).
+    /// Internal compiler fault; indicates a compiler bug, never a user error.
     InternalIrInvalid = 30,
     /// Missing / bad entry point (no zero-param `fn main`).
     EntryPointInvalid = 15,

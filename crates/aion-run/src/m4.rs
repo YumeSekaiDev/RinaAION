@@ -3,8 +3,10 @@
 
 use super::trace;
 use super::{execute, Config, Outcome, RunResult, Value};
-use aion_ir::{ExprKind, TypedBlock, TypedExpr, TypedFn, TypedModule, ValidatedModule};
-use aion_sem_model::Ty;
+use aion_ir::{
+    AllocKind, ArenaTable, ExprKind, TypedBlock, TypedExpr, TypedFn, TypedModule, ValidatedModule,
+};
+use aion_sem_model::{ScopeId, Ty};
 use aion_span::{ByteSpan, FileId};
 use aion_syntax::BinOp;
 
@@ -21,6 +23,8 @@ fn int_expr(v: i64, s: u32, e: u32) -> TypedExpr {
         ty: Ty::Int,
         span: sp(s, e),
         kind: ExprKind::Int(v),
+        // Inert for non-string types; assigned explicitly.
+        alloc: AllocKind::Refcounted,
     }
 }
 
@@ -43,6 +47,8 @@ pub(crate) fn fixture_basic() -> TypedModule {
             lhs: Box::new(int_expr(2, 4, 5)),
             rhs: Box::new(int_expr(3, 8, 9)),
         },
+        // Inert for non-string types; assigned explicitly.
+        alloc: AllocKind::Refcounted,
     };
     let add = TypedExpr {
         ty: Ty::Int,
@@ -52,18 +58,25 @@ pub(crate) fn fixture_basic() -> TypedModule {
             lhs: Box::new(int_expr(1, 0, 1)),
             rhs: Box::new(mul),
         },
+        // Inert for non-string types; assigned explicitly.
+        alloc: AllocKind::Refcounted,
     };
     TypedModule {
         name: String::from("m4"),
+        scope: ScopeId(u32::MAX),
         eof_span: sp(10, 10),
+        arenas: ArenaTable::new(),
         functions: vec![TypedFn {
             name: String::from("main"),
+            scope: ScopeId(u32::MAX - 1),
             decl_span: sp(0, 8),
             params: vec![],
             ret: Ty::Int,
             body: TypedBlock {
                 stmts: vec![aion_ir::TypedStmt::Do { expr: add }],
                 value: Ty::Int,
+                // Test root scope: this block's own scope.
+                scope: ScopeId(0),
             },
         }],
     }
@@ -97,15 +110,20 @@ pub(crate) fn fixture_shifted(delta: u32) -> TypedModule {
                 end: e.span.end + d,
             },
             kind,
+            // Allocation provenance survives the span shift unchanged.
+            alloc: e.alloc,
         }
     }
     let mut m = fixture_basic();
     for f in &mut m.functions {
+        // Preserve the body's own scope across the temporary swap.
+        let scope = f.body.scope;
         let body = std::mem::replace(
             &mut f.body,
             TypedBlock {
                 stmts: vec![],
                 value: Ty::Unit,
+                scope,
             },
         );
         let stmts = body
@@ -121,6 +139,7 @@ pub(crate) fn fixture_shifted(delta: u32) -> TypedModule {
         f.body = TypedBlock {
             stmts,
             value: body.value,
+            scope: body.scope,
         };
         f.decl_span = ByteSpan {
             file: f.decl_span.file,
@@ -263,18 +282,25 @@ fn hooks_disabled_vs_enabled_parity() {
             lhs: Box::new(int_expr(1, 0, 1)),
             rhs: Box::new(int_expr(0, 4, 5)),
         },
+        // Inert for non-string types; assigned explicitly.
+        alloc: AllocKind::Refcounted,
     };
     let tm = TypedModule {
         name: String::from("t"),
+        scope: ScopeId(u32::MAX),
         eof_span: sp(6, 6),
+        arenas: ArenaTable::new(),
         functions: vec![TypedFn {
             name: String::from("main"),
+            scope: ScopeId(u32::MAX - 1),
             decl_span: sp(0, 8),
             params: vec![],
             ret: Ty::Int,
             body: TypedBlock {
                 stmts: vec![aion_ir::TypedStmt::Do { expr: div }],
                 value: Ty::Int,
+                // Test root scope: this block's own scope.
+                scope: ScopeId(0),
             },
         }],
     };
@@ -374,18 +400,25 @@ fn trace_golden_str_and_trap() {
         ty: Ty::Str,
         span: sp(0, 4),
         kind: ExprKind::Str(String::from("hi")),
+        // Explicit refcounted provenance for string fixtures.
+        alloc: AllocKind::Refcounted,
     };
     let m = TypedModule {
         name: String::from("s"),
+        scope: ScopeId(u32::MAX),
         eof_span: sp(5, 5),
+        arenas: ArenaTable::new(),
         functions: vec![TypedFn {
             name: String::from("main"),
+            scope: ScopeId(u32::MAX - 1),
             decl_span: sp(0, 8),
             params: vec![],
             ret: Ty::Str,
             body: TypedBlock {
                 stmts: vec![aion_ir::TypedStmt::Do { expr: stre }],
                 value: Ty::Str,
+                // Test root scope: this block's own scope.
+                scope: ScopeId(0),
             },
         }],
     };
@@ -402,18 +435,25 @@ fn trace_golden_str_and_trap() {
             lhs: Box::new(int_expr(1, 0, 1)),
             rhs: Box::new(int_expr(0, 4, 5)),
         },
+        // Inert for non-string types; assigned explicitly.
+        alloc: AllocKind::Refcounted,
     };
     let tm = TypedModule {
         name: String::from("t"),
+        scope: ScopeId(u32::MAX),
         eof_span: sp(6, 6),
+        arenas: ArenaTable::new(),
         functions: vec![TypedFn {
             name: String::from("main"),
+            scope: ScopeId(u32::MAX - 1),
             decl_span: sp(0, 8),
             params: vec![],
             ret: Ty::Int,
             body: TypedBlock {
                 stmts: vec![aion_ir::TypedStmt::Do { expr: div }],
                 value: Ty::Int,
+                // Test root scope: this block's own scope.
+                scope: ScopeId(0),
             },
         }],
     };

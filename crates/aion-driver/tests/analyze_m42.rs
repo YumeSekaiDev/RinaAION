@@ -109,7 +109,9 @@ fn e0014_multi_var_diags_in_deterministic_span_order() {
     };
     let mut first: Option<String> = None;
     for _ in 0..10 {
-        let (_, ldiags) = aion_ir::lower(&parse, &model, fid(), src.len() as u32);
+        let Err(ldiags) = aion_ir::lower(&parse, &model, fid(), src.len() as u32) else {
+            panic!("expected unresolved-type lowering failure")
+        };
         assert!(ldiags.len() >= 2, "two residual Vars expected: {ldiags:?}");
         assert!(ldiags
             .iter()

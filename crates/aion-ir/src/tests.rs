@@ -1,6 +1,7 @@
 //! M3.2 lowering tests: shape, access kinds, E0014 gate, span preservation.
 use super::*;
 use aion_span::FileId;
+use aion_syntax::Item;
 
 fn parse_check(src: &str) -> (ParseResult, aion_sem_model::SemModel, Vec<Diagnostic>) {
     let file = FileId(0);
@@ -13,8 +14,8 @@ fn parse_check(src: &str) -> (ParseResult, aion_sem_model::SemModel, Vec<Diagnos
 fn lower_clean(src: &str) -> (TypedModule, ParseResult) {
     let (parse, model, diags) = parse_check(src);
     assert!(diags.is_empty(), "sema diags: {:?}", diags);
-    let (m, ldiags) = lower(&parse, &model, FileId(0), src.len() as u32);
-    assert!(ldiags.is_empty(), "lower diags: {:?}", ldiags);
+    let m = lower(&parse, &model, FileId(0), src.len() as u32)
+        .unwrap_or_else(|diags| panic!("lower failed: {diags:?}"));
     (m, parse)
 }
 
@@ -40,8 +41,8 @@ fn assert_flags() -> aion_syntax::FeatureFlags {
 fn lower_flags(src: &str) -> (TypedModule, ParseResult) {
     let (parse, model, diags) = parse_check_flags(src, assert_flags());
     assert!(diags.is_empty(), "sema diags: {:?}", diags);
-    let (m, ldiags) = lower(&parse, &model, FileId(0), src.len() as u32);
-    assert!(ldiags.is_empty(), "lower diags: {:?}", ldiags);
+    let m = lower(&parse, &model, FileId(0), src.len() as u32)
+        .unwrap_or_else(|diags| panic!("lower failed: {diags:?}"));
     (m, parse)
 }
 
@@ -53,8 +54,8 @@ fn assert_lowers_to_distinct_typed_assert() {
     let src = "fn main() { assert 1 == 1; }";
     let (parse, model, diags) = parse_check_flags(src, assert_flags());
     assert!(diags.is_empty(), "sema diags: {:?}", diags);
-    let (m, ldiags) = lower(&parse, &model, FileId(0), src.len() as u32);
-    assert!(ldiags.is_empty(), "lower diags: {:?}", ldiags);
+    let m = lower(&parse, &model, FileId(0), src.len() as u32)
+        .unwrap_or_else(|diags| panic!("lower failed: {diags:?}"));
     let main = &m.functions[0];
     assert_eq!(main.body.stmts.len(), 1);
     // No block value: assertions contribute nothing.
@@ -148,6 +149,132 @@ fn assert_non_bool_operand_is_e0010() {
         diags.iter().any(|d| d.code == ErrorCode::TypeMismatch),
         "expected E0010, got {:?}",
         diags.iter().map(|d| d.render_human()).collect::<Vec<_>>()
+    );
+}
+
+/// Collect every lowered string-typed expression and block scope.
+fn lowered_allocs_and_scopes(m: &TypedModule) -> (Vec<AllocKind>, Vec<ScopeId>) {
+    fn exprs(e: &TypedExpr, out: &mut Vec<AllocKind>) {
+        if e.ty == Ty::Str {
+            out.push(e.alloc);
+        }
+        match &e.kind {
+            ExprKind::Unary { rhs, .. } => exprs(rhs, out),
+            ExprKind::Binary { lhs, rhs, .. } => {
+                exprs(lhs, out);
+                exprs(rhs, out);
+            }
+            ExprKind::Call { args, .. } => {
+                for a in args {
+                    exprs(a, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn block(b: &TypedBlock, allocs: &mut Vec<AllocKind>, scopes: &mut Vec<ScopeId>) {
+        scopes.push(b.scope);
+        for s in &b.stmts {
+            match s {
+                TypedStmt::Let { init, .. } => exprs(init, allocs),
+                TypedStmt::Do { expr } => exprs(expr, allocs),
+                TypedStmt::Assert { expr, .. } => exprs(expr, allocs),
+                TypedStmt::AssertFalse { .. } => {}
+                TypedStmt::Block { body } => block(body, allocs, scopes),
+                TypedStmt::Empty => {}
+            }
+        }
+    }
+    let mut allocs = Vec::new();
+    let mut scopes = Vec::new();
+    for f in &m.functions {
+        block(&f.body, &mut allocs, &mut scopes);
+    }
+    (allocs, scopes)
+}
+
+#[test]
+fn string_nodes_carry_explicit_refcounted_provenance() {
+    // Stage 3: every lowered string-typed expression is explicitly
+    // refcounted (no defaults, no arena allocation yet).
+    let (m, _) = lower_flags("fn main() { let s = \"hi\"; do s; assert s == \"hi\"; }");
+    let (allocs, _) = lowered_allocs_and_scopes(&m);
+    assert!(!allocs.is_empty(), "expected string operands");
+    assert!(
+        allocs.iter().all(|a| *a == AllocKind::Refcounted),
+        "all string nodes must be explicitly refcounted: {allocs:?}"
+    );
+}
+
+#[test]
+fn lowered_blocks_carry_published_scopes() {
+    // Stage 3: every lowered block's scope matches the model's
+    // published mapping; scopes nest distinctly.
+    let src = "fn main() { let x = 1; { do x; { do x; } } do x; }";
+    let (parse, model, diags) = parse_check_flags(src, assert_flags());
+    assert!(diags.is_empty(), "sema diags: {:?}", diags);
+    let m = lower(&parse, &model, FileId(0), src.len() as u32)
+        .unwrap_or_else(|diags| panic!("lower failed: {diags:?}"));
+    let (_, scopes) = lowered_allocs_and_scopes(&m);
+    assert_eq!(scopes.len(), 3, "fn body plus two nested blocks");
+    let mut published: std::collections::HashSet<ScopeId> = std::collections::HashSet::new();
+    for item in &parse.index.items {
+        if let ItemIds::Fn(fids) = item {
+            let mut nodes = Vec::new();
+            collect_block_nodes(&fids.body, &mut nodes);
+            for n in nodes {
+                published.insert(model.block_scopes[&n]);
+            }
+        }
+    }
+    for s in &scopes {
+        assert!(
+            published.contains(s),
+            "lowered scope {s:?} must be a published scope"
+        );
+    }
+    let mut uniq = scopes.clone();
+    uniq.sort_by_key(|s| s.0);
+    uniq.dedup_by_key(|s| s.0);
+    assert_eq!(uniq.len(), scopes.len(), "nested scopes must be distinct");
+}
+
+fn collect_block_nodes(bids: &BlockIds, out: &mut Vec<NodeId>) {
+    out.push(bids.node);
+    for sid in &bids.stmts {
+        if let StmtIds::Block { body, .. } = sid {
+            collect_block_nodes(body, out);
+        }
+    }
+}
+
+#[test]
+fn missing_scope_fails_closed_without_partial_ir() {
+    // Removing one published scope entry must fail lowering for the
+    // whole function: an internal diagnostic, no default scope, and
+    // no partially lowered function in the output module.
+    let src = "fn main() { let x = 1; { do x; } do x; }";
+    let (parse, mut model, diags) = parse_check_flags(src, assert_flags());
+    assert!(diags.is_empty(), "sema must be clean: {:?}", diags);
+    let mut nodes = Vec::new();
+    for item in &parse.index.items {
+        if let ItemIds::Fn(fids) = item {
+            collect_block_nodes(&fids.body, &mut nodes);
+        }
+    }
+    let removed = nodes[1];
+    assert!(model.block_scopes.remove(&removed).is_some());
+    let Err(ldiags) = lower(&parse, &model, FileId(0), src.len() as u32) else {
+        panic!("expected lowering failure")
+    };
+    assert!(
+        ldiags.iter().any(|d| {
+            d.code == ErrorCode::InternalIrInvalid
+                && d.code.code_str() == "AION-E0030"
+                && d.message.contains("block scope missing")
+        }),
+        "expected fail-closed diagnostic, got {:?}",
+        ldiags.iter().map(|d| d.render_human()).collect::<Vec<_>>()
     );
 }
 
@@ -381,8 +508,9 @@ fn unresolved_var_gates_e0014_with_no_ir() {
     let src = "fn id(x) { do x; }";
     let (parse, model, diags) = parse_check(src);
     assert!(diags.is_empty());
-    let (m, ldiags) = lower(&parse, &model, FileId(0), src.len() as u32);
-    assert!(m.functions.is_empty());
+    let Err(ldiags) = lower(&parse, &model, FileId(0), src.len() as u32) else {
+        panic!("expected unresolved-type failure")
+    };
     assert!(!ldiags.is_empty());
     assert!(ldiags.iter().all(|d| d.code == ErrorCode::UnresolvedType));
     assert_eq!(ldiags[0].code.code_str(), "AION-E0014");
@@ -445,11 +573,12 @@ fn lower_threads_decl_and_eof_spans() {
 
 mod validate_tests {
     use super::super::{
-        lower, validate, ExprKind, LocalAccess, TypedBlock, TypedExpr, TypedFn, TypedModule,
-        TypedStmt,
+        lower, validate, AllocKind, ExprKind, LocalAccess, TypedBlock, TypedExpr, TypedFn,
+        TypedModule, TypedStmt,
     };
+    use super::lower_clean;
     use aion_error::ErrorCode;
-    use aion_sem_model::Ty;
+    use aion_sem_model::{ScopeId, Ty};
     use aion_span::{ByteSpan, FileId};
     use aion_syntax::{BinOp, UnOp};
 
@@ -462,6 +591,7 @@ mod validate_tests {
             ty: Ty::Int,
             span: sp(s, e),
             kind: ExprKind::Int(v),
+            alloc: AllocKind::Refcounted,
         }
     }
 
@@ -470,6 +600,8 @@ mod validate_tests {
             ty: Ty::Str,
             span: sp(s, e),
             kind: ExprKind::Str(v.to_string()),
+            // Explicit refcounted provenance for string literals.
+            alloc: AllocKind::Refcounted,
         }
     }
 
@@ -481,6 +613,8 @@ mod validate_tests {
                 name: name.to_string(),
                 access,
             },
+            // Inert for non-string types; assigned explicitly.
+            alloc: AllocKind::Refcounted,
         }
     }
 
@@ -492,6 +626,8 @@ mod validate_tests {
                 op,
                 rhs: Box::new(rhs),
             },
+            // Inert for non-string types; assigned explicitly.
+            alloc: AllocKind::Refcounted,
         }
     }
 
@@ -504,6 +640,8 @@ mod validate_tests {
                 lhs: Box::new(lhs),
                 rhs: Box::new(rhs),
             },
+            // Inert for non-string types; assigned explicitly.
+            alloc: AllocKind::Refcounted,
         }
     }
 
@@ -515,6 +653,8 @@ mod validate_tests {
                 callee: callee.to_string(),
                 args,
             },
+            // Inert for non-string types; assigned explicitly.
+            alloc: AllocKind::Refcounted,
         }
     }
 
@@ -525,12 +665,29 @@ mod validate_tests {
         stmts: Vec<TypedStmt>,
         value: Ty,
     ) -> TypedFn {
+        mk_fn_at(ScopeId(1001), name, params, ret, stmts, value)
+    }
+
+    fn mk_fn_at(
+        scope: ScopeId,
+        name: &str,
+        params: Vec<(String, Ty)>,
+        ret: Ty,
+        stmts: Vec<TypedStmt>,
+        value: Ty,
+    ) -> TypedFn {
         TypedFn {
             name: name.to_string(),
+            scope,
             decl_span: sp(0, 9),
             params,
             ret,
-            body: TypedBlock { stmts, value },
+            // Single-block fixture: the body's own scope.
+            body: TypedBlock {
+                stmts,
+                value,
+                scope: ScopeId(scope.0 + 1),
+            },
         }
     }
 
@@ -565,7 +722,7 @@ mod validate_tests {
 
     fn valid_module() -> TypedModule {
         // fn main() -> int { let x: int = 1; do x; }
-        let mut m = TypedModule::new("t");
+        let mut m = TypedModule::new("t", ScopeId(1000));
         m.functions.push(mk_fn(
             "main",
             vec![],
@@ -586,8 +743,32 @@ mod validate_tests {
     }
 
     #[test]
+    fn diagnostics_are_deduplicated_by_source_span() {
+        let shared = sp(1, 2);
+        let mut m = TypedModule::new("t", ScopeId(1000));
+        m.functions.push(mk_fn(
+            "main",
+            vec![],
+            Ty::Int,
+            vec![
+                do_stmt(local("missing_first", Ty::Int, LocalAccess::Copy, 1, 2)),
+                do_stmt(local("missing_second", Ty::Int, LocalAccess::Copy, 1, 2)),
+            ],
+            Ty::Int,
+        ));
+
+        let ds = check(&m);
+
+        assert_eq!(ds.len(), 1, "distinct nodes with one span dedupe: {ds:?}");
+        assert_eq!(ds[0].code, ErrorCode::InternalIrInvalid);
+        assert_eq!(ds[0].span, Some(shared));
+        assert_eq!(ds[0].message, "use of unbound slot `missing_first`");
+        assert_eq!(ds[0].notes, vec!["ir validator: WF1"]);
+    }
+
+    #[test]
     fn wf1_unbound_slot() {
-        let mut m = TypedModule::new("t");
+        let mut m = TypedModule::new("t", ScopeId(1000));
         m.functions.push(mk_fn(
             "main",
             vec![],
@@ -600,25 +781,40 @@ mod validate_tests {
 
     #[test]
     fn wf2_use_after_move() {
-        let mut m = TypedModule::new("t");
+        // The first consumption is a legal let-initializer Move. The
+        // later use is a different span and is already-moved, so WF2
+        // wins and WF9 does not also fire.
+        let mut m = TypedModule::new("t", ScopeId(1000));
         m.functions.push(mk_fn(
             "main",
             vec![],
             Ty::Str,
             vec![
                 let_stmt("s", Ty::Str, str_lit("a", 1, 4)),
-                do_stmt(local("s", Ty::Str, LocalAccess::Move, 5, 6)),
+                let_stmt("t", Ty::Str, local("s", Ty::Str, LocalAccess::Move, 5, 6)),
                 do_stmt(local("s", Ty::Str, LocalAccess::Copy, 7, 8)),
             ],
             Ty::Str,
         ));
-        assert_single_e0030(&check(&m));
+        let ds = check(&m);
+        assert_single_e0030(&ds);
+        assert_eq!(ds[0].span, Some(sp(7, 8)));
+        assert!(
+            ds[0].notes.iter().any(|n| n.contains("WF2")),
+            "notes: {:?}",
+            ds[0].notes
+        );
+        assert!(
+            ds[0].notes.iter().all(|n| !n.contains("WF9")),
+            "WF9 must not share this span: {:?}",
+            ds[0].notes
+        );
     }
 
     #[test]
     fn wf3_ret_mismatch() {
         // Declares `-> int` but the body yields `()`.
-        let mut m = TypedModule::new("t");
+        let mut m = TypedModule::new("t", ScopeId(1000));
         m.functions
             .push(mk_fn("main", vec![], Ty::Int, vec![], Ty::Unit));
         let ds = check(&m);
@@ -629,7 +825,7 @@ mod validate_tests {
     #[test]
     fn wf4_operator_mismatch() {
         // `1 + 2` recorded as Bool.
-        let mut m = TypedModule::new("t");
+        let mut m = TypedModule::new("t", ScopeId(1000));
         m.functions.push(mk_fn(
             "main",
             vec![],
@@ -649,7 +845,7 @@ mod validate_tests {
 
     #[test]
     fn wf4_arity_mismatch() {
-        let mut m = TypedModule::new("t");
+        let mut m = TypedModule::new("t", ScopeId(1000));
         m.functions.push(mk_fn(
             "id",
             vec![("s".to_string(), Ty::Str)],
@@ -664,7 +860,8 @@ mod validate_tests {
             ))],
             Ty::Bool,
         ));
-        m.functions.push(mk_fn(
+        m.functions.push(mk_fn_at(
+            ScopeId(1003),
             "main",
             vec![],
             Ty::Bool,
@@ -681,8 +878,10 @@ mod validate_tests {
             ty: Ty::Int,
             span: ByteSpan::empty(FileId(0), 0),
             kind: ExprKind::Int(1),
+            // Inert for non-string types; assigned explicitly.
+            alloc: AllocKind::Refcounted,
         };
-        let mut m = TypedModule::new("t");
+        let mut m = TypedModule::new("t", ScopeId(1000));
         m.functions
             .push(mk_fn("main", vec![], Ty::Int, vec![do_stmt(e)], Ty::Int));
         assert_single_e0030(&check(&m));
@@ -690,7 +889,7 @@ mod validate_tests {
 
     #[test]
     fn wf6_dangling_callee() {
-        let mut m = TypedModule::new("t");
+        let mut m = TypedModule::new("t", ScopeId(1000));
         m.functions.push(mk_fn(
             "main",
             vec![],
@@ -704,7 +903,7 @@ mod validate_tests {
     #[test]
     fn wf7_move_of_copy_typed_slot() {
         // Lowering never emits `Move` for a non-owned slot.
-        let mut m = TypedModule::new("t");
+        let mut m = TypedModule::new("t", ScopeId(1000));
         m.functions.push(mk_fn(
             "main",
             vec![],
@@ -720,20 +919,35 @@ mod validate_tests {
 
     #[test]
     fn wf7_copy_of_str_after_move() {
-        // Covered by WF2 (any use after move); must still be exactly one E0030.
-        let mut m = TypedModule::new("t");
+        // A second Move after a legal let-init Move is WF2 only.
+        let mut m = TypedModule::new("t", ScopeId(1000));
         m.functions.push(mk_fn(
             "main",
             vec![],
             Ty::Str,
             vec![
                 let_stmt("s", Ty::Str, str_lit("a", 1, 4)),
-                do_stmt(local("s", Ty::Str, LocalAccess::Move, 5, 6)),
+                let_stmt("t", Ty::Str, local("s", Ty::Str, LocalAccess::Move, 5, 6)),
                 do_stmt(local("s", Ty::Str, LocalAccess::Move, 7, 8)),
             ],
             Ty::Str,
         ));
-        assert_single_e0030(&check(&m));
+        let ds = check(&m);
+        assert_single_e0030(&ds);
+        assert_eq!(ds[0].span, Some(sp(7, 8)));
+        assert!(
+            ds[0].notes.iter().any(|n| n.contains("WF2")),
+            "notes: {:?}",
+            ds[0].notes
+        );
+        assert!(
+            ds[0]
+                .notes
+                .iter()
+                .all(|n| !n.contains("WF9") && !n.contains("WF7")),
+            "later use must stay WF2: {:?}",
+            ds[0].notes
+        );
     }
 
     #[test]
@@ -741,7 +955,7 @@ mod validate_tests {
         // Hand-built IR with two `main`s (sema would emit AION-E0013 on
         // the real pipeline, so this only arises adversarially) must
         // fail validation — dup mains must never silently execute.
-        let mut m = TypedModule::new("t");
+        let mut m = TypedModule::new("t", ScopeId(1000));
         m.functions.push(mk_fn(
             "main",
             vec![],
@@ -749,7 +963,8 @@ mod validate_tests {
             vec![do_stmt(int_lit(1, 1, 2))],
             Ty::Int,
         ));
-        let mut second = mk_fn(
+        let mut second = mk_fn_at(
+            ScopeId(1003),
             "main",
             vec![],
             Ty::Int,
@@ -771,19 +986,19 @@ mod validate_tests {
     #[test]
     fn adversarial_totality() {
         // Empty module, zero functions: clean, no panic.
-        let ds = check(&TypedModule::new("empty"));
+        let ds = check(&TypedModule::new("empty", ScopeId(1000)));
         assert!(ds.is_empty());
         // Deep nesting: no panic.
         let mut deep = int_lit(1, 1, 2);
         for i in 0..500u32 {
             deep = unary(UnOp::Neg, deep, Ty::Int, 1, 10 + i);
         }
-        let mut m = TypedModule::new("deep");
+        let mut m = TypedModule::new("deep", ScopeId(1000));
         m.functions
             .push(mk_fn("main", vec![], Ty::Int, vec![do_stmt(deep)], Ty::Int));
         let _ = validate(&m);
         // Garbage types and empty blocks: no panic.
-        let mut g = TypedModule::new("garbage");
+        let mut g = TypedModule::new("garbage", ScopeId(1000));
         g.functions.push(mk_fn(
             "f",
             vec![("p".to_string(), Ty::Var(7))],
@@ -794,6 +1009,9 @@ mod validate_tests {
                     body: TypedBlock {
                         stmts: vec![],
                         value: Ty::Var(3),
+                        // Nested block gets its own scope, distinct
+                        // from the enclosing function-body scope.
+                        scope: ScopeId(1),
                     },
                 },
                 do_stmt(local("missing", Ty::Var(1), LocalAccess::Move, 2, 3)),
@@ -805,6 +1023,616 @@ mod validate_tests {
         assert!(!ds.is_empty());
     }
 
+    fn rule_notes(ds: &[aion_error::Diagnostic]) -> Vec<String> {
+        ds.iter().flat_map(|d| d.notes.clone()).collect()
+    }
+
+    #[test]
+    fn wf7_precedes_wf9_on_move_of_int() {
+        // Trailing `do` of an Int would also be the wrong stamp for a
+        // return, but WF7 reports the non-Str Move first.
+        let mut m = TypedModule::new("t", ScopeId(1000));
+        m.functions.push(mk_fn(
+            "main",
+            vec![],
+            Ty::Int,
+            vec![
+                let_stmt("x", Ty::Int, int_lit(1, 1, 2)),
+                do_stmt(local("x", Ty::Int, LocalAccess::Move, 3, 4)),
+            ],
+            Ty::Int,
+        ));
+        let ds = check(&m);
+        assert_single_e0030(&ds);
+        assert!(
+            ds[0].notes.iter().any(|n| n.contains("WF7")),
+            "notes: {:?}",
+            ds[0].notes
+        );
+        assert!(ds[0].notes.iter().all(|n| !n.contains("WF9")));
+    }
+
+    #[test]
+    fn wf9_move_outside_a_move_site() {
+        // A non-final `do` of a live Str is a borrow. Stamping Move is WF9,
+        // and that stamp still consumes the slot.
+        let mut m = TypedModule::new("t", ScopeId(1000));
+        m.functions.push(mk_fn(
+            "main",
+            vec![],
+            Ty::Str,
+            vec![
+                let_stmt("s", Ty::Str, str_lit("a", 1, 4)),
+                do_stmt(local("s", Ty::Str, LocalAccess::Move, 5, 6)),
+                do_stmt(local("s", Ty::Str, LocalAccess::Copy, 7, 8)),
+            ],
+            Ty::Str,
+        ));
+        let ds = check(&m);
+        assert_eq!(ds.len(), 2, "got {ds:?}");
+        assert!(ds.iter().all(|d| d.code == ErrorCode::InternalIrInvalid));
+        assert_eq!(ds[0].span, Some(sp(5, 6)));
+        assert!(ds[0].notes.iter().any(|n| n.contains("WF9")), "{:?}", ds[0]);
+        assert_eq!(ds[1].span, Some(sp(7, 8)));
+        assert!(ds[1].notes.iter().any(|n| n.contains("WF2")), "{:?}", ds[1]);
+    }
+
+    #[test]
+    fn wf9_copy_on_let_init_and_trailing_return() {
+        let mut m = TypedModule::new("t", ScopeId(1000));
+        m.functions.push(mk_fn(
+            "main",
+            vec![],
+            Ty::Str,
+            vec![
+                let_stmt("a", Ty::Str, str_lit("a", 1, 4)),
+                let_stmt("b", Ty::Str, local("a", Ty::Str, LocalAccess::Copy, 5, 6)),
+                do_stmt(local("b", Ty::Str, LocalAccess::Copy, 7, 8)),
+            ],
+            Ty::Str,
+        ));
+        let ds = check(&m);
+        assert_eq!(ds.len(), 2, "got {:?}", rule_notes(&ds));
+        assert!(ds.iter().all(|d| d.notes.iter().any(|n| n.contains("WF9"))));
+        assert_eq!(ds[0].span, Some(sp(5, 6)));
+        assert_eq!(ds[1].span, Some(sp(7, 8)));
+    }
+
+    #[test]
+    fn wf9_move_nested_under_call_or_assert() {
+        // A local under an operator is not the call-argument root.
+        let mut nested = TypedModule::new("t", ScopeId(1000));
+        nested.functions.push(mk_fn(
+            "f",
+            vec![("p".into(), Ty::Bool)],
+            Ty::Bool,
+            vec![do_stmt(local("p", Ty::Bool, LocalAccess::Copy, 1, 2))],
+            Ty::Bool,
+        ));
+        nested.functions.push(mk_fn_at(
+            ScopeId(1003),
+            "main",
+            vec![],
+            Ty::Bool,
+            vec![
+                let_stmt("s", Ty::Str, str_lit("a", 3, 6)),
+                do_stmt(call(
+                    "f",
+                    vec![binary(
+                        BinOp::Eq,
+                        local("s", Ty::Str, LocalAccess::Move, 7, 8),
+                        str_lit("a", 9, 12),
+                        Ty::Bool,
+                        7,
+                        12,
+                    )],
+                    Ty::Bool,
+                    7,
+                    14,
+                )),
+            ],
+            Ty::Bool,
+        ));
+        let ds = check(&nested);
+        assert_single_e0030(&ds);
+        assert_eq!(ds[0].span, Some(sp(7, 8)));
+        assert!(ds[0].notes.iter().any(|n| n.contains("WF9")), "{ds:?}");
+
+        // An assertion operand suppresses even a direct call-argument move.
+        let mut asserted = TypedModule::new("t", ScopeId(1000));
+        asserted.functions.push(mk_fn(
+            "f",
+            vec![("p".into(), Ty::Str)],
+            Ty::Str,
+            vec![do_stmt(local("p", Ty::Str, LocalAccess::Move, 1, 2))],
+            Ty::Str,
+        ));
+        asserted.functions.push(mk_fn_at(
+            ScopeId(1003),
+            "main",
+            vec![],
+            Ty::Unit,
+            vec![
+                let_stmt("s", Ty::Str, str_lit("a", 3, 6)),
+                TypedStmt::Assert {
+                    expr: call(
+                        "f",
+                        vec![local("s", Ty::Str, LocalAccess::Move, 8, 9)],
+                        Ty::Bool,
+                        7,
+                        11,
+                    ),
+                    span: sp(7, 12),
+                    provenance: aion_error::AssertProvenance::human_authored(),
+                },
+            ],
+            Ty::Unit,
+        ));
+        let ds = check(&asserted);
+        assert_single_e0030(&ds);
+        assert_eq!(ds[0].span, Some(sp(8, 9)));
+        assert!(ds[0].notes.iter().any(|n| n.contains("WF9")), "{ds:?}");
+    }
+
+    #[test]
+    fn legal_move_sites_and_nested_copy_pass() {
+        let mut m = TypedModule::new("t", ScopeId(1000));
+        m.functions.push(mk_fn(
+            "id",
+            vec![("s".into(), Ty::Str)],
+            Ty::Str,
+            vec![do_stmt(local("s", Ty::Str, LocalAccess::Move, 1, 2))],
+            Ty::Str,
+        ));
+        m.functions.push(mk_fn_at(
+            ScopeId(1003),
+            "main",
+            vec![],
+            Ty::Str,
+            vec![
+                let_stmt("a", Ty::Str, str_lit("hi", 3, 7)),
+                TypedStmt::Block {
+                    body: TypedBlock {
+                        stmts: vec![
+                            let_stmt("s", Ty::Str, str_lit("n", 8, 11)),
+                            do_stmt(local("s", Ty::Str, LocalAccess::Copy, 12, 13)),
+                        ],
+                        value: Ty::Str,
+                        scope: ScopeId(1),
+                    },
+                },
+                let_stmt("b", Ty::Str, local("a", Ty::Str, LocalAccess::Move, 14, 15)),
+                do_stmt(call(
+                    "id",
+                    vec![local("b", Ty::Str, LocalAccess::Move, 16, 17)],
+                    Ty::Str,
+                    16,
+                    20,
+                )),
+            ],
+            Ty::Str,
+        ));
+        let ds = check(&m);
+        assert!(ds.is_empty(), "unexpected diags: {ds:?}");
+    }
+
+    #[test]
+    fn assert_true_shape_keeps_wf3_when_stamp_is_copy() {
+        // Lowering drops `assert true`, so a preceding `do` can be the
+        // last IR statement while `TypedFn.ret` stays Unit. Copy matches
+        // that return type. WF3 reports the value mismatch.
+        let mut m = TypedModule::new("t", ScopeId(1000));
+        m.functions.push(mk_fn(
+            "main",
+            vec![],
+            Ty::Unit,
+            vec![
+                let_stmt("s", Ty::Str, str_lit("hi", 1, 5)),
+                do_stmt(local("s", Ty::Str, LocalAccess::Copy, 6, 7)),
+            ],
+            Ty::Str,
+        ));
+        let ds = check(&m);
+        assert_single_e0030(&ds);
+        assert!(
+            ds[0].notes.iter().any(|n| n.contains("WF3")),
+            "notes: {:?}",
+            ds[0].notes
+        );
+        assert!(ds[0].notes.iter().all(|n| !n.contains("WF9")));
+    }
+
+    #[test]
+    fn move_stamp_on_assert_true_shape_is_wf9() {
+        // The same shape with a Move stamp occupies the span with WF9,
+        // so WF3 does not also fire on that node.
+        let mut m = TypedModule::new("t", ScopeId(1000));
+        m.functions.push(mk_fn(
+            "main",
+            vec![],
+            Ty::Unit,
+            vec![
+                let_stmt("s", Ty::Str, str_lit("hi", 1, 5)),
+                do_stmt(local("s", Ty::Str, LocalAccess::Move, 6, 7)),
+            ],
+            Ty::Str,
+        ));
+        let ds = check(&m);
+        assert_single_e0030(&ds);
+        assert_eq!(ds[0].span, Some(sp(6, 7)));
+        assert!(ds[0].notes.iter().any(|n| n.contains("WF9")), "{ds:?}");
+        assert!(ds[0].notes.iter().all(|n| !n.contains("WF3")));
+    }
+
+    fn wf14_diags(m: &TypedModule) -> Vec<aion_error::Diagnostic> {
+        check(m)
+            .into_iter()
+            .filter(|d| d.notes.iter().any(|note| note == "ir validator: WF14"))
+            .collect()
+    }
+
+    #[test]
+    fn wf14_accepts_unique_nonmonotonic_scope_ancestry() {
+        let mut m = TypedModule::new("scopes", ScopeId(41));
+        let first = mk_fn_at(
+            ScopeId(7),
+            "first",
+            vec![],
+            Ty::Int,
+            vec![TypedStmt::Block {
+                body: TypedBlock {
+                    stmts: vec![TypedStmt::Block {
+                        body: TypedBlock {
+                            stmts: vec![do_stmt(int_lit(1, 1, 2))],
+                            value: Ty::Int,
+                            scope: ScopeId(90),
+                        },
+                    }],
+                    // Phase 4: recursive result propagates through nesting.
+                    value: Ty::Int,
+                    scope: ScopeId(3),
+                },
+            }],
+            Ty::Int,
+        );
+        let second = mk_fn_at(
+            ScopeId(100),
+            "main",
+            vec![],
+            Ty::Int,
+            vec![do_stmt(int_lit(3, 4, 5))],
+            Ty::Int,
+        );
+        m.functions = vec![first, second];
+        assert!(validate(&m).is_ok(), "unique opaque IDs should pass");
+    }
+
+    #[test]
+    fn wf14_module_function_collision_uses_later_function_span() {
+        let mut m = TypedModule::new("duplicate", ScopeId(50));
+        m.eof_span = sp(30, 30);
+        let mut f = mk_fn_at(
+            m.scope,
+            "main",
+            vec![],
+            Ty::Int,
+            vec![do_stmt(int_lit(1, 1, 2))],
+            Ty::Int,
+        );
+        f.decl_span = sp(10, 20);
+        m.functions.push(f);
+        let ds = wf14_diags(&m);
+        assert_eq!(ds.len(), 1, "{ds:?}");
+        assert_eq!(ds[0].code, ErrorCode::InternalIrInvalid);
+        assert_eq!(
+            ds[0].message,
+            "scope id 50 is assigned to more than one scope"
+        );
+        assert_eq!(ds[0].span, Some(sp(10, 20)));
+        assert_eq!(ds[0].notes, vec!["ir validator: WF14"]);
+        assert!(
+            validate(&m).is_err(),
+            "invalid scopes must block validation"
+        );
+    }
+
+    #[test]
+    fn wf14_duplicate_function_scopes_use_later_declaration_span() {
+        let mut m = TypedModule::new("duplicate", ScopeId(50));
+        let mut first = mk_fn_at(
+            ScopeId(20),
+            "first",
+            vec![],
+            Ty::Int,
+            vec![do_stmt(int_lit(1, 1, 2))],
+            Ty::Int,
+        );
+        first.decl_span = sp(10, 20);
+        let mut second = mk_fn_at(
+            ScopeId(20),
+            "second",
+            vec![],
+            Ty::Int,
+            vec![do_stmt(int_lit(2, 3, 4))],
+            Ty::Int,
+        );
+        second.body.scope = ScopeId(22);
+        second.decl_span = sp(21, 30);
+        m.functions = vec![first, second];
+        let ds = wf14_diags(&m);
+        assert_eq!(ds.len(), 1, "{ds:?}");
+        assert_eq!(ds[0].span, Some(sp(21, 30)));
+        assert_eq!(
+            ds[0].message,
+            "scope id 20 is assigned to more than one scope"
+        );
+    }
+
+    #[test]
+    fn wf14_function_block_collision_uses_later_block_expression_span() {
+        let mut m = TypedModule::new("duplicate", ScopeId(50));
+        let mut f = mk_fn_at(
+            ScopeId(20),
+            "main",
+            vec![],
+            Ty::Int,
+            vec![do_stmt(int_lit(1, 1, 2))],
+            Ty::Int,
+        );
+        f.decl_span = sp(10, 20);
+        f.body.scope = f.scope;
+        m.functions.push(f);
+        let ds = wf14_diags(&m);
+        assert_eq!(ds.len(), 1, "{ds:?}");
+        assert_eq!(ds[0].span, Some(sp(1, 2)));
+        assert_eq!(
+            ds[0].message,
+            "scope id 20 is assigned to more than one scope"
+        );
+    }
+
+    #[test]
+    fn wf14_block_collision_uses_later_expression_span() {
+        let mut m = TypedModule::new("duplicate", ScopeId(50));
+        let mut f = mk_fn_at(
+            ScopeId(20),
+            "main",
+            vec![],
+            Ty::Int,
+            vec![
+                TypedStmt::Block {
+                    body: TypedBlock {
+                        stmts: vec![do_stmt(int_lit(1, 1, 2))],
+                        value: Ty::Int,
+                        scope: ScopeId(3),
+                    },
+                },
+                TypedStmt::Block {
+                    body: TypedBlock {
+                        stmts: vec![do_stmt(int_lit(2, 3, 4))],
+                        value: Ty::Int,
+                        scope: ScopeId(3),
+                    },
+                },
+            ],
+            // Phase 4: body derives Int through the trailing block.
+            Ty::Int,
+        );
+        f.decl_span = sp(10, 20);
+        m.functions.push(f);
+        let ds = wf14_diags(&m);
+        assert_eq!(ds.len(), 1, "{ds:?}");
+        assert_eq!(ds[0].span, Some(sp(3, 4)));
+        assert_eq!(
+            ds[0].message,
+            "scope id 3 is assigned to more than one scope"
+        );
+    }
+
+    #[test]
+    fn wf14_nested_block_collision_uses_later_block_span() {
+        let mut m = TypedModule::new("duplicate", ScopeId(50));
+        let mut f = mk_fn_at(
+            ScopeId(20),
+            "main",
+            vec![],
+            Ty::Int,
+            vec![TypedStmt::Block {
+                body: TypedBlock {
+                    stmts: vec![
+                        do_stmt(int_lit(0, 1, 2)),
+                        TypedStmt::Block {
+                            body: TypedBlock {
+                                stmts: vec![do_stmt(int_lit(1, 3, 4))],
+                                value: Ty::Int,
+                                scope: ScopeId(3),
+                            },
+                        },
+                    ],
+                    // Phase 4: recursive result propagates through nesting.
+                    value: Ty::Int,
+                    scope: ScopeId(3),
+                },
+            }],
+            // Phase 4: body derives Int through the trailing block.
+            Ty::Int,
+        );
+        f.decl_span = sp(10, 20);
+        m.functions.push(f);
+        let ds = wf14_diags(&m);
+        assert_eq!(ds.len(), 1, "{ds:?}");
+        assert_eq!(
+            ds[0].message,
+            "scope id 3 is assigned to more than one scope"
+        );
+        assert_eq!(ds[0].span, Some(sp(3, 4)));
+    }
+
+    #[test]
+    fn wf14_empty_block_collision_uses_function_declaration_span() {
+        let mut m = TypedModule::new("duplicate", ScopeId(50));
+        let mut f = mk_fn_at(
+            ScopeId(20),
+            "main",
+            vec![],
+            Ty::Unit,
+            vec![
+                TypedStmt::Block {
+                    body: TypedBlock {
+                        stmts: vec![do_stmt(int_lit(1, 1, 2))],
+                        value: Ty::Int,
+                        scope: ScopeId(3),
+                    },
+                },
+                TypedStmt::Block {
+                    body: TypedBlock {
+                        stmts: vec![],
+                        value: Ty::Unit,
+                        scope: ScopeId(3),
+                    },
+                },
+            ],
+            Ty::Unit,
+        );
+        f.decl_span = sp(10, 20);
+        m.functions.push(f);
+        let ds = wf14_diags(&m);
+        assert_eq!(ds.len(), 1, "{ds:?}");
+        assert_eq!(ds[0].span, Some(sp(10, 20)));
+    }
+
+    #[test]
+    fn wf14_reports_each_later_duplicate_assignment() {
+        let mut m = TypedModule::new("duplicate", ScopeId(50));
+        let mut f = mk_fn_at(
+            ScopeId(20),
+            "main",
+            vec![],
+            Ty::Int,
+            vec![1u32, 3, 5]
+                .into_iter()
+                .map(|start| TypedStmt::Block {
+                    body: TypedBlock {
+                        stmts: vec![do_stmt(int_lit(start.into(), start, start + 1))],
+                        value: Ty::Int,
+                        scope: ScopeId(3),
+                    },
+                })
+                .collect(),
+            // Phase 4: body derives Int through the trailing block.
+            Ty::Int,
+        );
+        f.decl_span = sp(10, 20);
+        m.functions.push(f);
+
+        let ds = wf14_diags(&m);
+        assert_eq!(ds.len(), 2, "{ds:?}");
+        assert_eq!(ds[0].span, Some(sp(3, 4)));
+        assert_eq!(ds[1].span, Some(sp(5, 6)));
+        assert!(ds.iter().all(|diag| {
+            diag.code == ErrorCode::InternalIrInvalid
+                && diag.message == "scope id 3 is assigned to more than one scope"
+                && diag.notes == vec!["ir validator: WF14"]
+        }));
+    }
+
+    #[test]
+    fn wf14_follows_existing_wf_diagnostics_and_respects_span_deduplication() {
+        let mut m = TypedModule::new("ordered", ScopeId(50));
+        m.eof_span = sp(1, 2);
+        let mut f = mk_fn_at(
+            m.scope,
+            "main",
+            vec![],
+            Ty::Int,
+            vec![do_stmt(local("unbound", Ty::Int, LocalAccess::Copy, 1, 2))],
+            Ty::Int,
+        );
+        f.decl_span = sp(1, 2);
+        m.functions.push(f);
+        let ds = check(&m);
+        assert_eq!(
+            ds.len(),
+            1,
+            "WF1 at the shared span suppresses WF14: {ds:?}"
+        );
+        assert_eq!(ds[0].notes, vec!["ir validator: WF1"]);
+
+        let mut ordered = TypedModule::new("ordered", ScopeId(50));
+        ordered.eof_span = sp(30, 30);
+        let mut duplicate = mk_fn_at(
+            ordered.scope,
+            "main",
+            vec![],
+            Ty::Int,
+            vec![do_stmt(local("unbound", Ty::Int, LocalAccess::Copy, 1, 2))],
+            Ty::Int,
+        );
+        duplicate.decl_span = sp(10, 20);
+        ordered.functions.push(duplicate);
+        let ds = check(&ordered);
+        assert_eq!(ds.len(), 2, "{ds:?}");
+        assert_eq!(ds[0].notes, vec!["ir validator: WF1"]);
+        assert_eq!(ds[1].notes, vec!["ir validator: WF14"]);
+    }
+
+    #[test]
+    fn wf8_candidates_use_first_diagnostic_per_span() {
+        let mut m = TypedModule::new("wf8", ScopeId(10));
+        let first = mk_fn_at(ScopeId(20), "duplicate", vec![], Ty::Unit, vec![], Ty::Unit);
+        let mut second = mk_fn_at(
+            ScopeId(30),
+            "duplicate",
+            vec![],
+            Ty::Int,
+            vec![do_stmt(local(
+                "missing",
+                Ty::Int,
+                LocalAccess::Copy,
+                20,
+                21,
+            ))],
+            Ty::Int,
+        );
+        second.decl_span = sp(20, 21);
+        let mut third = mk_fn_at(ScopeId(40), "duplicate", vec![], Ty::Unit, vec![], Ty::Unit);
+        third.decl_span = sp(30, 31);
+        let mut fourth = mk_fn_at(ScopeId(50), "duplicate", vec![], Ty::Unit, vec![], Ty::Unit);
+        fourth.decl_span = sp(30, 31);
+        m.functions = vec![first, second, third, fourth];
+
+        let ds = check(&m);
+        assert!(
+            ds.iter().any(
+                |diag| diag.notes == vec!["ir validator: WF1"] && diag.span == Some(sp(20, 21))
+            ),
+            "WF1 must win the span shared with WF8: {ds:?}"
+        );
+        assert!(
+            ds.iter().any(
+                |diag| diag.span == Some(sp(30, 31)) && diag.notes == vec!["ir validator: WF8"]
+            ),
+            "WF8 should still be emitted at an otherwise unclaimed span: {ds:?}"
+        );
+        assert_eq!(
+            ds.iter()
+                .filter(|diag| diag.span == Some(sp(20, 21)))
+                .count(),
+            1,
+            "only one diagnostic may claim WF1's span: {ds:?}"
+        );
+        assert_eq!(
+            ds.iter()
+                .filter(|diag| diag.span == Some(sp(30, 31)))
+                .count(),
+            1,
+            "duplicate WF8 candidates at one span must deduplicate: {ds:?}"
+        );
+        assert!(!ds
+            .iter()
+            .any(|diag| diag.notes == vec!["ir validator: WF14"]));
+    }
+
     #[test]
     fn lowered_clean_module_validates() {
         // End to end: real lowering output passes the validator.
@@ -814,9 +1642,273 @@ mod validate_tests {
             aion_sema::check_with_model(&parse, FileId(0), b"fn main() { let x = 1 + 2; do x; }");
         assert!(diags.is_empty());
         let src = b"fn main() { let x = 1 + 2; do x; }";
-        let (m, ldiags) = lower(&parse, &model, FileId(0), src.len() as u32);
-        assert!(ldiags.is_empty());
+        let m = lower(&parse, &model, FileId(0), src.len() as u32)
+            .unwrap_or_else(|diags| panic!("lower failed: {diags:?}"));
         validate(&m).expect("clean module must validate");
+    }
+
+    // Phase 4: recursive block-result validation.
+
+    fn nested_block(stmts: Vec<TypedStmt>, value: Ty, scope: u32) -> TypedStmt {
+        TypedStmt::Block {
+            body: TypedBlock {
+                stmts,
+                value,
+                scope: ScopeId(scope),
+            },
+        }
+    }
+
+    fn assert_stmt(s: u32, e: u32) -> TypedStmt {
+        TypedStmt::Assert {
+            expr: binary(
+                BinOp::Eq,
+                int_lit(1, s, e),
+                int_lit(1, s, e),
+                Ty::Bool,
+                s,
+                e,
+            ),
+            span: sp(s, e),
+            provenance: aion_error::AssertProvenance::human_authored(),
+        }
+    }
+
+    fn assert_false_stmt(s: u32, e: u32) -> TypedStmt {
+        TypedStmt::AssertFalse {
+            span: sp(s, e),
+            provenance: aion_error::AssertProvenance::human_authored(),
+        }
+    }
+
+    #[test]
+    fn phase4_recursive_multi_level_result_passes() {
+        // fn main() -> int { { { do 1; } } }: result derives through
+        // three levels to the innermost `do`.
+        let inner = nested_block(vec![do_stmt(int_lit(1, 4, 5))], Ty::Int, 2002);
+        let mid = nested_block(vec![inner], Ty::Int, 2001);
+        let mut m = TypedModule::new("t", ScopeId(1000));
+        m.functions
+            .push(mk_fn("main", vec![], Ty::Int, vec![mid], Ty::Int));
+        assert!(check(&m).is_empty(), "deep result must validate");
+    }
+
+    #[test]
+    fn phase4_wrong_nested_value_rejected_at_innermost_span() {
+        // Inner block claims Bool while recursion derives Int.
+        let inner = nested_block(vec![do_stmt(int_lit(1, 4, 5))], Ty::Bool, 2002);
+        let mid = nested_block(vec![inner], Ty::Int, 2001);
+        let mut m = TypedModule::new("t", ScopeId(1000));
+        m.functions
+            .push(mk_fn("main", vec![], Ty::Int, vec![mid], Ty::Int));
+        let ds = check(&m);
+        assert_single_e0030(&ds);
+        assert_eq!(ds[0].span, Some(sp(4, 5)));
+        assert_eq!(ds[0].notes, vec!["ir validator: WF4"]);
+    }
+
+    #[test]
+    fn phase4_wrong_mid_level_value_rejected() {
+        // Mid block claims Unit while recursion through it derives Int.
+        let inner = nested_block(vec![do_stmt(int_lit(1, 4, 5))], Ty::Int, 2002);
+        let mid = nested_block(vec![inner], Ty::Unit, 2001);
+        let mut m = TypedModule::new("t", ScopeId(1000));
+        m.functions
+            .push(mk_fn("main", vec![], Ty::Int, vec![mid], Ty::Unit));
+        let ds = check(&m);
+        assert_single_e0030(&ds);
+        assert_eq!(ds[0].span, Some(sp(4, 5)));
+        assert_eq!(ds[0].notes, vec!["ir validator: WF4"]);
+    }
+
+    #[test]
+    fn phase4_wrong_fn_return_rejected_through_nesting() {
+        // Body derives Int through nesting but declares Bool return.
+        let inner = nested_block(vec![do_stmt(int_lit(1, 4, 5))], Ty::Int, 2001);
+        let mut m = TypedModule::new("t", ScopeId(1000));
+        m.functions
+            .push(mk_fn("main", vec![], Ty::Bool, vec![inner], Ty::Int));
+        let ds = check(&m);
+        assert_single_e0030(&ds);
+        assert_eq!(ds[0].span, Some(sp(4, 5)));
+        assert_eq!(ds[0].notes, vec!["ir validator: WF3"]);
+        assert!(
+            ds[0].message.contains("function returns"),
+            "unexpected message: {}",
+            ds[0].message
+        );
+    }
+
+    #[test]
+    fn phase4_final_let_assert_and_empty_yield_unit() {
+        // Final Let, Assert, AssertFalse, Empty, and no statements all
+        // derive Unit; a Unit value validates clean.
+        let cases: Vec<Vec<TypedStmt>> = vec![
+            vec![let_stmt("x", Ty::Int, int_lit(1, 10, 11))],
+            vec![assert_stmt(10, 12)],
+            vec![assert_false_stmt(10, 12)],
+            vec![TypedStmt::Empty],
+            vec![],
+        ];
+        for (i, stmts) in cases.into_iter().enumerate() {
+            let mut m = TypedModule::new("t", ScopeId(1000));
+            m.functions
+                .push(mk_fn("main", vec![], Ty::Unit, stmts, Ty::Unit));
+            assert!(check(&m).is_empty(), "case {i} must derive Unit");
+        }
+    }
+
+    #[test]
+    fn phase4_final_let_with_non_unit_value_rejected() {
+        // A function body ending in `let` derives Unit; claiming Int is
+        // a WF3 mismatch (function bodies report WF3, nested blocks WF4).
+        let mut m = TypedModule::new("t", ScopeId(1000));
+        m.functions.push(mk_fn(
+            "main",
+            vec![],
+            Ty::Unit,
+            vec![let_stmt("x", Ty::Int, int_lit(1, 10, 11))],
+            Ty::Int,
+        ));
+        let ds = check(&m);
+        assert_single_e0030(&ds);
+        assert_eq!(ds[0].notes, vec!["ir validator: WF3"]);
+        assert!(
+            ds[0].message.contains("must be `()` without trailing `do`"),
+            "unexpected message: {}",
+            ds[0].message
+        );
+    }
+
+    #[test]
+    fn phase4_nested_final_let_with_non_unit_value_rejected() {
+        // A nested block ending in `let` derives Unit; claiming Int is
+        // a WF4 mismatch at the initializer span.
+        let inner = nested_block(
+            vec![let_stmt("x", Ty::Int, int_lit(1, 10, 11))],
+            Ty::Int,
+            2001,
+        );
+        let mut m = TypedModule::new("t", ScopeId(1000));
+        m.functions
+            .push(mk_fn("main", vec![], Ty::Unit, vec![inner], Ty::Unit));
+        let ds = check(&m);
+        assert_single_e0030(&ds);
+        assert_eq!(ds[0].span, Some(sp(10, 11)));
+        assert_eq!(ds[0].notes, vec!["ir validator: WF4"]);
+        assert!(
+            ds[0].message.contains("must be `()` without trailing `do`"),
+            "unexpected message: {}",
+            ds[0].message
+        );
+    }
+
+    #[test]
+    fn phase4_nested_final_let_yields_unit() {
+        // { let x = 1; } as trailing block derives Unit, not Int.
+        let inner = nested_block(
+            vec![let_stmt("x", Ty::Int, int_lit(1, 10, 11))],
+            Ty::Unit,
+            2001,
+        );
+        let mut m = TypedModule::new("t", ScopeId(1000));
+        m.functions
+            .push(mk_fn("main", vec![], Ty::Unit, vec![inner], Ty::Unit));
+        assert!(check(&m).is_empty());
+    }
+
+    #[test]
+    fn phase4_trailing_empty_yields_unit() {
+        // Per the contract, a final `Empty` yields Unit even when a
+        // value-producing statement precedes it.
+        let mut m = TypedModule::new("t", ScopeId(1000));
+        m.functions.push(mk_fn(
+            "main",
+            vec![],
+            Ty::Unit,
+            vec![do_stmt(int_lit(1, 4, 5)), TypedStmt::Empty],
+            Ty::Unit,
+        ));
+        assert!(check(&m).is_empty());
+    }
+
+    #[test]
+    fn phase4_trailing_empty_with_non_unit_value_rejected() {
+        // [do 1, Empty] derives Unit; claiming Int is a WF3 mismatch.
+        let mut m = TypedModule::new("t", ScopeId(1000));
+        m.functions.push(mk_fn(
+            "main",
+            vec![],
+            Ty::Unit,
+            vec![do_stmt(int_lit(1, 4, 5)), TypedStmt::Empty],
+            Ty::Int,
+        ));
+        let ds = check(&m);
+        assert_single_e0030(&ds);
+        assert_eq!(ds[0].notes, vec!["ir validator: WF3"]);
+    }
+
+    #[test]
+    fn phase4_final_block_child_selected_by_position() {
+        // Two nested blocks: the parent must reuse the FINAL child's
+        // derivation (Unit), not the earlier one (Int). This pins the
+        // bottom-up capture against positional mix-ups.
+        let first = nested_block(vec![do_stmt(int_lit(1, 4, 5))], Ty::Int, 2001);
+        let second = nested_block(
+            vec![let_stmt("x", Ty::Int, int_lit(1, 10, 11))],
+            Ty::Unit,
+            2002,
+        );
+        let mut m = TypedModule::new("t", ScopeId(1000));
+        m.functions.push(mk_fn(
+            "main",
+            vec![],
+            Ty::Unit,
+            vec![first, second],
+            Ty::Unit,
+        ));
+        assert!(check(&m).is_empty());
+    }
+
+    #[test]
+    fn phase4_nested_final_local_read_stays_copy() {
+        // Lowered nested `do a` is a Copy read: recursion must not
+        // promote it to a return Move, and validation must pass.
+        let (m, _) = lower_clean("fn main() { let a = \"hi\"; { do a; } do 1; }");
+        let f = &m.functions[0];
+        assert_eq!(f.body.value, Ty::Int);
+        match &f.body.stmts[1] {
+            TypedStmt::Block { body } => match &body.stmts[0] {
+                TypedStmt::Do { expr } => match &expr.kind {
+                    ExprKind::Local { name, access } => {
+                        assert_eq!(name, "a");
+                        assert_eq!(*access, LocalAccess::Copy);
+                    }
+                    k => panic!("expected local, got {k:?}"),
+                },
+                s => panic!("expected do, got {s:?}"),
+            },
+            s => panic!("expected block, got {s:?}"),
+        };
+        validate(&m).expect("nested copy read must validate");
+    }
+
+    #[test]
+    fn phase4_direct_trailing_return_still_moves() {
+        // The approved direct-return Move site is unchanged by recursion.
+        let (m, _) = lower_clean("fn id(s) { do s; } fn main() { let a = \"hi\"; do id(a); }");
+        validate(&m).expect("direct return move must validate");
+        let id = m.functions.iter().find(|f| f.name == "id").unwrap();
+        match &id.body.stmts[0] {
+            TypedStmt::Do { expr } => match &expr.kind {
+                ExprKind::Local { name, access } => {
+                    assert_eq!(name, "s");
+                    assert_eq!(*access, LocalAccess::Move);
+                }
+                k => panic!("expected local, got {k:?}"),
+            },
+            s => panic!("expected do, got {s:?}"),
+        }
     }
 }
 
@@ -947,8 +2039,8 @@ fn move_authority_is_sema_recorded_set() {
         let (parse, model, diags) = parse_check(src);
         assert!(diags.is_empty(), "sema diags for {src:?}: {diags:?}");
         let uses = ident_uses_in_order(&parse);
-        let (m, ldiags) = lower(&parse, &model, FileId(0), src.len() as u32);
-        assert!(ldiags.is_empty(), "lower diags for {src:?}: {ldiags:?}");
+        let m = lower(&parse, &model, FileId(0), src.len() as u32)
+            .unwrap_or_else(|diags| panic!("lower failed: {diags:?}"));
         let accesses = lowered_accesses_in_order(&m);
         assert_eq!(
             uses.len(),
@@ -1008,17 +2100,491 @@ fn move_facts_preserved_for_canonical_programs() {
             "use-site {id:?} not recorded"
         );
     }
-    let (m, ldiags) = lower(&parse, &model, FileId(0), src.len() as u32);
-    assert!(ldiags.is_empty(), "lower diags: {ldiags:?}");
+    let m = lower(&parse, &model, FileId(0), src.len() as u32)
+        .unwrap_or_else(|diags| panic!("lower failed: {diags:?}"));
     // Byte-identical diagnostics path: clean sema stays clean.
     validate(&m).expect("clean module must validate");
 }
 
+fn locals_in_order(m: &TypedModule) -> Vec<(String, LocalAccess)> {
+    fn expr(e: &TypedExpr, out: &mut Vec<(String, LocalAccess)>) {
+        match &e.kind {
+            ExprKind::Local { name, access } => out.push((name.clone(), *access)),
+            ExprKind::Unary { rhs, .. } => expr(rhs, out),
+            ExprKind::Binary { lhs, rhs, .. } => {
+                expr(lhs, out);
+                expr(rhs, out);
+            }
+            ExprKind::Call { args, .. } => {
+                for a in args {
+                    expr(a, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn block(b: &TypedBlock, out: &mut Vec<(String, LocalAccess)>) {
+        for st in &b.stmts {
+            match st {
+                TypedStmt::Let { init, .. } => expr(init, out),
+                TypedStmt::Do { expr: e } => expr(e, out),
+                TypedStmt::Assert { expr: e, .. } => expr(e, out),
+                TypedStmt::AssertFalse { .. } => {}
+                TypedStmt::Block { body } => block(body, out),
+                TypedStmt::Empty => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for f in &m.functions {
+        block(&f.body, &mut out);
+    }
+    out
+}
+
+#[test]
+fn lowered_shadowed_body_return_is_move() {
+    // The new body local is the returned Str. The already-moved parameter
+    // must not keep that use site as Copy.
+    let src = "fn main(s) { let s = s; do s; } fn caller() { let t = \"hi\"; do main(t); }";
+    let (m, _) = lower_clean(src);
+    assert_eq!(
+        locals_in_order(&m),
+        vec![
+            ("s".to_string(), LocalAccess::Move),
+            ("s".to_string(), LocalAccess::Move),
+            ("t".to_string(), LocalAccess::Move),
+        ]
+    );
+    validate(&m).expect("shadowed return must validate");
+}
+
+#[test]
+fn lowered_nested_trailing_do_stays_copy() {
+    let src = "fn main() { { let s = \"hi\"; do s; } do \"ok\"; }";
+    let (parse, model, diags) = parse_check(src);
+    assert!(diags.is_empty(), "{diags:?}");
+    assert!(
+        model.moved_uses.is_empty(),
+        "nested trailing do is not a return move"
+    );
+    let (m, _) = lower_clean(src);
+    assert_eq!(
+        locals_in_order(&m),
+        vec![("s".to_string(), LocalAccess::Copy)]
+    );
+    let _ = parse;
+    validate(&m).expect("nested copy must validate");
+}
+
+#[test]
+fn lowered_root_function_name_stays_copy() {
+    // `do id` resolves to the root function in sema, so it is not a
+    // return move. Lowering's local scopes do not contain function
+    // names, so the same use is an unbound-name diagnostic and the
+    // placeholder stamp stays Copy.
+    let src = "fn id(s) { do s == \"x\"; do s; } fn main() { do id; }";
+    let (parse, model, diags) = parse_check(src);
+    assert!(diags.is_empty(), "{diags:?}");
+    let uses = ident_uses_in_order(&parse);
+    let id_use = *uses.last().expect("do id");
+    assert!(
+        !model.moved_uses.contains(&id_use),
+        "root function name must not be recorded"
+    );
+    assert_eq!(model.moved_uses.len(), 1, "only id's parameter return");
+    let Err(ldiags) = lower(&parse, &model, FileId(0), src.len() as u32) else {
+        panic!("expected lowering failure")
+    };
+    assert!(
+        ldiags
+            .iter()
+            .any(|d| d.message.contains("unbound name `id`")),
+        "lowering has no function-value slot: {ldiags:?}"
+    );
+}
+
+#[test]
+fn lowered_assert_true_does_not_invent_a_return_move() {
+    let src = "fn main() { let s = \"hi\"; do s; assert true; }";
+    let (m, _) = lower_flags(src);
+    let main = &m.functions[0];
+    assert_eq!(main.ret, Ty::Unit);
+    assert_eq!(main.body.value, Ty::Str);
+    assert_eq!(
+        locals_in_order(&m),
+        vec![("s".to_string(), LocalAccess::Copy)]
+    );
+    let ds = match validate(&m) {
+        Ok(_) => panic!("value/ret mismatch must not validate"),
+        Err(ds) => ds,
+    };
+    assert_eq!(ds.len(), 1, "{ds:?}");
+    assert!(
+        ds[0].notes.iter().any(|n| n.contains("WF3")),
+        "notes: {:?}",
+        ds[0].notes
+    );
+    assert!(ds[0].notes.iter().all(|n| !n.contains("WF9")));
+}
+
 #[test]
 fn module_new_compat() {
-    let m = Module::new("demo");
+    let m = Module::new("demo", ScopeId(1000));
     assert_eq!(m.name, "demo");
     assert!(m.functions.is_empty());
-    let tm = TypedModule::new("demo");
+    let tm = TypedModule::new("demo", ScopeId(1000));
     assert_eq!(tm, m);
+}
+
+#[test]
+fn lowering_publishes_module_function_and_block_scope_identities() {
+    let src = "fn first() { do 1; } fn second(x) { do x + 1; { do x; } }";
+    let (parse, model, diags) = parse_check(src);
+    assert!(diags.is_empty(), "sema: {diags:?}");
+    let module = lower(&parse, &model, FileId(0), src.len() as u32)
+        .unwrap_or_else(|ds| panic!("lower: {ds:?}"));
+    let roots: Vec<_> = model
+        .scope_tree
+        .scopes
+        .iter()
+        .enumerate()
+        .filter(|(_, scope)| scope.parent.is_none())
+        .map(|(index, _)| ScopeId(index as u32))
+        .collect();
+    assert_eq!(roots, [module.scope]);
+    assert_eq!(module.functions.len(), 2);
+    let mut seen = HashSet::from([module.scope]);
+    for (ir_fn, ids) in module.functions.iter().zip(&parse.index.items) {
+        let ItemIds::Fn(ids) = ids else {
+            panic!("function index")
+        };
+        let body_scope = model.block_scopes[&ids.body.node];
+        assert_eq!(
+            model.scope_tree.scopes[body_scope.0 as usize].parent,
+            Some(ir_fn.scope)
+        );
+        assert_eq!(
+            model.scope_tree.scopes[ir_fn.scope.0 as usize].parent,
+            Some(module.scope)
+        );
+        assert!(seen.insert(ir_fn.scope), "duplicate function scope");
+        assert!(seen.insert(ir_fn.body.scope), "duplicate body scope");
+        fn add_nested(block: &TypedBlock, seen: &mut HashSet<ScopeId>) {
+            for stmt in &block.stmts {
+                if let TypedStmt::Block { body } = stmt {
+                    assert!(seen.insert(body.scope), "duplicate nested block scope");
+                    add_nested(body, seen);
+                }
+            }
+        }
+        add_nested(&ir_fn.body, &mut seen);
+    }
+}
+
+#[test]
+fn empty_module_uses_the_unique_semantic_root() {
+    let src = "";
+    let (parse, model, diags) = parse_check(src);
+    assert!(diags.is_empty());
+    let module = lower(&parse, &model, FileId(0), 0).expect("empty module lowers");
+    assert!(module.functions.is_empty());
+    assert_eq!(module.scope, ScopeId(0));
+}
+
+#[test]
+fn lowering_rejects_missing_or_multiple_module_roots() {
+    let src = "fn main() { do 1; }";
+    let (parse, model, diags) = parse_check(src);
+    assert!(diags.is_empty());
+    let mut missing = model.clone();
+    missing.scope_tree.scopes.clear();
+    let Err(ds) = lower(&parse, &missing, FileId(0), src.len() as u32) else {
+        panic!("missing module root must fail")
+    };
+    assert!(ds.iter().any(|d| {
+        d.code == ErrorCode::InternalIrInvalid
+            && d.message == "scope tree has no parentless module scope"
+    }));
+    let mut multiple = model;
+    multiple.scope_tree.scopes.push(Default::default());
+    let Err(ds) = lower(&parse, &multiple, FileId(0), src.len() as u32) else {
+        panic!("multiple roots must fail")
+    };
+    assert!(ds.iter().any(|d| d.message.contains("multiple parentless")));
+}
+
+#[test]
+fn lowering_rejects_invalid_and_inconsistent_scope_relationships() {
+    let src = "fn main() { { do 1; } }";
+    let (parse, model, diags) = parse_check(src);
+    assert!(diags.is_empty());
+    let ItemIds::Fn(ids) = &parse.index.items[0] else {
+        panic!("function")
+    };
+
+    let mut missing_mapping = model.clone();
+    missing_mapping.block_scopes.remove(&ids.body.node);
+    assert!(lower(&parse, &missing_mapping, FileId(0), src.len() as u32).is_err());
+
+    let mut invalid_index = model.clone();
+    invalid_index
+        .block_scopes
+        .insert(ids.body.node, ScopeId(u32::MAX));
+    assert!(lower(&parse, &invalid_index, FileId(0), src.len() as u32).is_err());
+
+    let mut missing_body_parent = model.clone();
+    let body_scope = missing_body_parent.block_scopes[&ids.body.node];
+    missing_body_parent.scope_tree.scopes[body_scope.0 as usize].parent = None;
+    assert!(lower(&parse, &missing_body_parent, FileId(0), src.len() as u32).is_err());
+
+    let mut wrong_parameter_parent = model;
+    let function_scope = wrong_parameter_parent.scope_tree.scopes[body_scope.0 as usize]
+        .parent
+        .expect("parameter scope");
+    wrong_parameter_parent.scope_tree.scopes[function_scope.0 as usize].parent = Some(body_scope);
+    let Err(ds) = lower(&parse, &wrong_parameter_parent, FileId(0), src.len() as u32) else {
+        panic!("inconsistent parameter parent must fail")
+    };
+    assert!(ds
+        .iter()
+        .any(|d| d.message.contains("not under module scope")));
+}
+
+#[test]
+fn lowering_rejects_dangling_scope_parent_references() {
+    let src = "fn main() { do 1; }";
+    let (parse, mut model, diags) = parse_check(src);
+    assert!(diags.is_empty());
+    let ItemIds::Fn(ids) = &parse.index.items[0] else {
+        panic!("function")
+    };
+    let body_scope = model.block_scopes[&ids.body.node];
+    model.scope_tree.scopes[body_scope.0 as usize].parent = Some(ScopeId(u32::MAX));
+    let Err(ds) = lower(&parse, &model, FileId(0), src.len() as u32) else {
+        panic!("dangling scope parent must fail")
+    };
+    assert!(ds.iter().any(|d| {
+        d.code == ErrorCode::InternalIrInvalid
+            && d.message == "internal scope mismatch: function scope id is invalid"
+    }));
+}
+
+#[test]
+fn lowering_rejects_duplicate_scope_ids_for_distinct_sibling_blocks() {
+    let src = "fn main() { { do 1; } { do 2; } }";
+    let (parse, mut model, diags) = parse_check(src);
+    assert!(diags.is_empty());
+    let ItemIds::Fn(ids) = &parse.index.items[0] else {
+        panic!("function")
+    };
+    let (StmtIds::Block { body: first, .. }, StmtIds::Block { body: second, .. }) =
+        (&ids.body.stmts[0], &ids.body.stmts[1])
+    else {
+        panic!("expected sibling blocks")
+    };
+    let first_scope = model.block_scopes[&first.node];
+    model.block_scopes.insert(second.node, first_scope);
+    let Err(ds) = lower(&parse, &model, FileId(0), src.len() as u32) else {
+        panic!("duplicate block scope must fail")
+    };
+    assert!(ds.iter().any(|d| {
+        d.code == ErrorCode::InternalIrInvalid
+            && d.message == "internal scope mismatch: duplicate block scope id"
+    }));
+}
+
+#[test]
+fn lowering_rejects_nested_block_with_wrong_valid_parent() {
+    let src = "fn main() { { do 1; } }";
+    let (parse, mut model, diags) = parse_check(src);
+    assert!(diags.is_empty());
+    let ItemIds::Fn(ids) = &parse.index.items[0] else {
+        panic!("function")
+    };
+    let StmtIds::Block { body: nested, .. } = &ids.body.stmts[0] else {
+        panic!("nested block")
+    };
+    let function_scope = model.scope_tree.scopes[model.block_scopes[&ids.body.node].0 as usize]
+        .parent
+        .expect("function scope");
+    let nested_scope = model.block_scopes[&nested.node];
+    // This is a valid scope ID, but it gives the nested block the
+    // function scope as parent instead of its enclosing body block.
+    model.scope_tree.scopes[nested_scope.0 as usize].parent = Some(function_scope);
+    let Err(ds) = lower(&parse, &model, FileId(0), src.len() as u32) else {
+        panic!("wrong nested-block parent must fail")
+    };
+    assert!(ds.iter().any(|d| {
+        d.code == ErrorCode::InternalIrInvalid
+            && d.message == "internal scope mismatch: block scope has an inconsistent parent"
+    }));
+}
+
+#[test]
+fn lowered_blocks_match_published_scope_per_node() {
+    let src = "fn left() { { do 1; } { do 2; } } \
+               fn main() { let x = 1; assert true; { do x; { do x; } } do x; }";
+    let (parse, model, diags) = parse_check_flags(src, assert_flags());
+    assert!(diags.is_empty(), "sema diags: {diags:?}");
+    let module = lower(&parse, &model, FileId(0), src.len() as u32)
+        .unwrap_or_else(|diags| panic!("lower failed: {diags:?}"));
+    assert_eq!(parse.program.items.len(), parse.index.items.len());
+
+    let mut fns = module.functions.iter();
+    for (item, iids) in parse.program.items.iter().zip(parse.index.items.iter()) {
+        let (aion_syntax::Item::Fn(f), ItemIds::Fn(fids)) = (item, iids) else {
+            continue;
+        };
+        let tf = fns.next().expect("lower dropped a function");
+        assert_eq!(tf.name, f.name);
+        pair_block(&f.body, &fids.body, &tf.body, &model);
+    }
+    assert!(fns.next().is_none(), "lower invented a function");
+
+    let ItemIds::Fn(left) = &parse.index.items[0] else {
+        panic!("left")
+    };
+    let sibs: Vec<_> = left
+        .body
+        .stmts
+        .iter()
+        .filter_map(|s| {
+            if let StmtIds::Block { body, .. } = s {
+                Some(body.node)
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(sibs.len(), 2);
+    assert_ne!(model.block_scopes[&sibs[0]], model.block_scopes[&sibs[1]]);
+}
+
+fn pair_block(ast: &Block, ids: &BlockIds, ir: &TypedBlock, model: &aion_sem_model::SemModel) {
+    let published = model.block_scopes[&ids.node];
+    assert_eq!(
+        ir.scope, published,
+        "block {:?} has the wrong published scope",
+        ids.node
+    );
+    assert_eq!(
+        ast.stmts.len(),
+        ids.stmts.len(),
+        "block {:?} AST/index statement counts differ",
+        ids.node
+    );
+    let mut ir_stmts = ir.stmts.iter();
+    for (st, sid) in ast.stmts.iter().zip(ids.stmts.iter()) {
+        if matches!(
+            st,
+            Stmt::Assert {
+                expr: Expr::Bool(true),
+                ..
+            }
+        ) {
+            assert!(
+                matches!(sid, StmtIds::Assert { .. }),
+                "assert true paired with a non-assert index"
+            );
+            continue;
+        }
+        if matches!((st, sid), (Stmt::Goal(_), StmtIds::Goal { .. })) {
+            panic!("goal statements are not lowered to IR; refusing to consume the next statement");
+        }
+        let got = ir_stmts.next().expect("IR dropped a statement");
+        match (st, sid, got) {
+            (Stmt::Block(inner), StmtIds::Block { body, .. }, TypedStmt::Block { body: tb }) => {
+                pair_block(inner, body, tb, model);
+            }
+            (Stmt::Let { .. }, StmtIds::Let { .. }, TypedStmt::Let { .. }) => {}
+            (Stmt::Do(_), StmtIds::Do { .. }, TypedStmt::Do { .. }) => {}
+            (Stmt::Empty, StmtIds::Empty(_), TypedStmt::Empty) => {}
+            (
+                Stmt::Assert {
+                    expr: Expr::Bool(false),
+                    ..
+                },
+                StmtIds::Assert { .. },
+                TypedStmt::AssertFalse { .. },
+            ) => {}
+            (Stmt::Assert { .. }, StmtIds::Assert { .. }, TypedStmt::Assert { .. }) => {}
+            other => panic!("AST/IR shape diverged: {other:?}"),
+        }
+    }
+    assert!(ir_stmts.next().is_none(), "IR invented a statement");
+}
+
+#[test]
+fn statement_count_mismatch_omits_function_and_keeps_scope_stack() {
+    // `leaked + 0` grounds the parameter so the E0014 gate does not
+    // abort lowering before the mismatch. The nested index is cleared
+    // after sema; its block node and published scope stay.
+    let src = "fn bad(leaked) { let hidden = 1; do leaked + 0; { do hidden; } } \
+               fn main() { let x = 1; do x; do x; }";
+    let (mut parse, model, diags) = parse_check(src);
+    assert!(diags.is_empty(), "sema diags: {diags:?}");
+
+    let ItemIds::Fn(bad_ids) = &mut parse.index.items[0] else {
+        panic!("bad")
+    };
+    let StmtIds::Block { body, .. } = &mut bad_ids.body.stmts[2] else {
+        panic!("nested block");
+    };
+    body.stmts.clear();
+
+    let Item::Fn(main_ast) = &mut parse.program.items[1] else {
+        panic!("main")
+    };
+    rename_ident(&mut main_ast.body.stmts[1], "leaked");
+    rename_ident(&mut main_ast.body.stmts[2], "hidden");
+
+    let Err(ldiags) = lower(&parse, &model, FileId(0), src.len() as u32) else {
+        panic!("expected malformed-index failure")
+    };
+    assert!(ldiags.iter().any(|d| {
+        d.code == ErrorCode::InternalIrInvalid
+            && d.code.code_str() == "AION-E0030"
+            && d.message == "internal index mismatch: block statement count differs from index"
+    }));
+    assert!(ldiags.iter().all(|d| d.code != ErrorCode::UnresolvedType));
+    assert!(ldiags
+        .iter()
+        .all(|d| !d.message.contains("block scope missing")));
+    assert!(ldiags
+        .iter()
+        .any(|d| d.message.contains("unbound name `leaked`")));
+    assert!(ldiags
+        .iter()
+        .any(|d| d.message.contains("unbound name `hidden`")));
+}
+
+fn rename_ident(st: &mut Stmt, name: &str) {
+    let Stmt::Do(Expr::Ident(got)) = st else {
+        panic!("expected do ident")
+    };
+    *got = name.to_string();
+}
+
+#[test]
+fn lowered_module_arena_table_is_empty() {
+    let src = "fn main() { let s = \"hi\"; { do s; } do s; }";
+    let (module, _) = lower_flags(src);
+    assert!(
+        !module.functions.is_empty(),
+        "lowering must produce the function"
+    );
+    let (allocs, scopes) = lowered_allocs_and_scopes(&module);
+    assert_eq!(allocs.len(), 3, "literal plus two uses, got {allocs:?}");
+    assert_eq!(
+        scopes.len(),
+        2,
+        "function body plus nested block, got {scopes:?}"
+    );
+    assert!(
+        allocs.iter().all(|a| *a == AllocKind::Refcounted),
+        "string nodes must stay refcounted: {allocs:?}"
+    );
+    assert!(module.arenas.is_empty());
+    assert_eq!(module.arenas.len(), 0);
 }

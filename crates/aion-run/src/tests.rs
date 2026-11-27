@@ -3,8 +3,8 @@
 
 use super::*;
 use aion_error::AssertProvenance;
-use aion_ir::{TypedFn, TypedModule, ValidatedModule};
-use aion_sem_model::Ty;
+use aion_ir::{AllocKind, ArenaTable, TypedFn, TypedModule, ValidatedModule};
+use aion_sem_model::{ScopeId, Ty};
 use aion_span::{ByteSpan, FileId};
 
 fn sp(s: u32, e: u32) -> ByteSpan {
@@ -20,6 +20,9 @@ fn expr(ty: Ty, s: u32, e: u32, kind: ExprKind) -> TypedExpr {
         ty,
         span: sp(s, e),
         kind,
+        // Test IR is explicitly refcounted; string-typed fixtures
+        // built through this helper carry Refcounted provenance.
+        alloc: AllocKind::Refcounted,
     }
 }
 
@@ -37,9 +40,12 @@ fn main_fn(body: TypedBlock) -> TypedModule {
     let ret = body.value.clone();
     TypedModule {
         name: String::new(),
+        scope: ScopeId(u32::MAX),
         eof_span: sp(0, 0),
+        arenas: ArenaTable::new(),
         functions: vec![TypedFn {
             name: "main".to_string(),
+            scope: ScopeId(u32::MAX - 1),
             decl_span: sp(0, 9),
             params: vec![],
             ret,
@@ -71,6 +77,8 @@ fn do_block(e: TypedExpr, value: Ty) -> TypedBlock {
     TypedBlock {
         stmts: vec![aion_ir::TypedStmt::Do { expr: e }],
         value,
+        // Test root scope: this block's own scope.
+        scope: ScopeId(0),
     }
 }
 
@@ -89,6 +97,8 @@ fn assert_block(e: TypedExpr, span: ByteSpan) -> TypedBlock {
             provenance: AssertProvenance::human_authored(),
         }],
         value: Ty::Unit,
+        // Test root scope: this block's own scope.
+        scope: ScopeId(0),
     }
 }
 
@@ -156,7 +166,7 @@ fn folded_false_fixture_module() -> ValidatedModule {
     );
     assert!(parse.errors.is_empty(), "fixture must parse clean");
     let mut tree = aion_sem_model::ScopeTree::new();
-    let root = tree.root();
+    let root = tree.root().expect("fixture root allocation");
     assert!(tree.define(
         root,
         aion_sem_model::Symbol {
@@ -170,15 +180,19 @@ fn folded_false_fixture_module() -> ValidatedModule {
             moved: false,
         },
     ));
-    let model = aion_sem_model::SemModel {
+    let mut model = aion_sem_model::SemModel {
         items: Vec::new(),
         scope_tree: tree,
         types: std::collections::HashMap::new(),
         moved_uses: std::collections::HashSet::new(),
         ..Default::default()
     };
-    let (module, diags) = aion_ir::lower(&parse, &model, FileId(0), text.len() as u32);
-    assert!(diags.is_empty(), "must lower clean");
+    // Hand-built model bypasses sema: assign explicit, deterministic
+    // scopes mirroring the checker's walk so lowering's fail-closed
+    // scope lookup succeeds.
+    model.block_scopes = crate::oracle::fixture_block_scopes(&parse, &mut model.scope_tree, root);
+    let module = aion_ir::lower(&parse, &model, FileId(0), text.len() as u32)
+        .unwrap_or_else(|diags| panic!("lower failed: {diags:?}"));
     validated(&module)
 }
 
@@ -224,6 +238,8 @@ fn assert_false_block(span: ByteSpan) -> TypedBlock {
             provenance: AssertProvenance::human_authored(),
         }],
         value: Ty::Unit,
+        // Test root scope: this block's own scope.
+        scope: ScopeId(0),
     }
 }
 
@@ -283,7 +299,7 @@ fn assert_false_trap_is_recorded_with_statement_span() {
 
 #[test]
 fn entry_missing_is_e0015() {
-    let mut m = TypedModule::new("x");
+    let mut m = TypedModule::new("x", ScopeId(u32::MAX));
     m.eof_span = ByteSpan::empty(FileId(0), 17);
     let d = trap_of(execute(&validated(&m), &Config::default()));
     assert_eq!(d.code, ErrorCode::EntryPointInvalid);
@@ -298,16 +314,19 @@ fn entry_missing_is_e0015() {
 /// Bad-signature `main` pins its declaration span (E0015).
 #[test]
 fn entry_with_params_pins_decl_span() {
-    let mut m = TypedModule::new("x");
+    let mut m = TypedModule::new("x", ScopeId(u32::MAX));
     m.eof_span = ByteSpan::empty(FileId(0), 40);
     m.functions.push(TypedFn {
         name: "main".to_string(),
+        scope: ScopeId(u32::MAX - 1),
         decl_span: sp(0, 14),
         params: vec![("a".to_string(), Ty::Int)],
         ret: Ty::Unit,
         body: TypedBlock {
             stmts: vec![],
             value: Ty::Unit,
+            // Test root scope: this block's own scope.
+            scope: ScopeId(0),
         },
     });
     let d = trap_of(execute(&validated(&m), &Config::default()));
@@ -333,15 +352,20 @@ fn only_validated_modules_execute() {
 fn entry_with_params_is_e0015() {
     let m = TypedModule {
         name: String::new(),
+        scope: ScopeId(u32::MAX),
         eof_span: sp(0, 0),
+        arenas: ArenaTable::new(),
         functions: vec![TypedFn {
             name: "main".to_string(),
+            scope: ScopeId(u32::MAX - 1),
             decl_span: sp(0, 14),
             params: vec![("a".to_string(), Ty::Int)],
             ret: Ty::Unit,
             body: TypedBlock {
                 stmts: vec![],
                 value: Ty::Unit,
+                // Test root scope: this block's own scope.
+                scope: ScopeId(0),
             },
         }],
     };
@@ -537,10 +561,13 @@ fn recursion_cap_e0043_with_call_span() {
     );
     let m = TypedModule {
         name: String::new(),
+        scope: ScopeId(u32::MAX),
         eof_span: sp(0, 0),
+        arenas: ArenaTable::new(),
         functions: vec![
             TypedFn {
                 name: "loopy".to_string(),
+                scope: ScopeId(u32::MAX - 1),
                 decl_span: sp(0, 11),
                 params: vec![],
                 ret: Ty::Unit,
@@ -548,21 +575,26 @@ fn recursion_cap_e0043_with_call_span() {
             },
             TypedFn {
                 name: "main".to_string(),
+                scope: ScopeId(u32::MAX - 2),
                 decl_span: sp(12, 22),
                 params: vec![],
                 ret: Ty::Unit,
-                body: do_block(
-                    expr(
+                body: {
+                    let mut body = do_block(
+                        expr(
+                            Ty::Unit,
+                            0,
+                            8,
+                            ExprKind::Call {
+                                callee: "loopy".to_string(),
+                                args: vec![],
+                            },
+                        ),
                         Ty::Unit,
-                        0,
-                        8,
-                        ExprKind::Call {
-                            callee: "loopy".to_string(),
-                            args: vec![],
-                        },
-                    ),
-                    Ty::Unit,
-                ),
+                    );
+                    body.scope = ScopeId(1);
+                    body
+                },
             },
         ],
     };
@@ -599,6 +631,8 @@ fn move_semantics_str_transfer_no_clone() {
             },
         ],
         value: Ty::Str,
+        // Test root scope: this block's own scope.
+        scope: ScopeId(0),
     };
     let m = main_fn(body);
     assert_eq!(run_ok(&m).value, Value::Unit);
@@ -674,6 +708,8 @@ fn nested_block_trailing_value_and_do_discarded() {
             aion_ir::TypedStmt::Do { expr: int(2, 2, 3) },
         ],
         value: Ty::Int,
+        // Nested block scope, distinct from the enclosing scope below.
+        scope: ScopeId(1),
     };
     let body = TypedBlock {
         stmts: vec![
@@ -681,6 +717,8 @@ fn nested_block_trailing_value_and_do_discarded() {
             aion_ir::TypedStmt::Do { expr: int(3, 4, 5) },
         ],
         value: Ty::Int,
+        // Test root scope: this block's own scope.
+        scope: ScopeId(0),
     };
     let m = main_fn(body);
     assert!(matches!(
@@ -695,10 +733,13 @@ fn args_evaluated_left_to_right() {
     // L-to-R: first arg div-zero traps before second is evaluated.
     let m = TypedModule {
         name: String::new(),
+        scope: ScopeId(u32::MAX),
         eof_span: sp(0, 0),
+        arenas: ArenaTable::new(),
         functions: vec![
             TypedFn {
                 name: "second".to_string(),
+                scope: ScopeId(u32::MAX - 1),
                 decl_span: sp(0, 20),
                 params: vec![("a".to_string(), Ty::Int), ("b".to_string(), Ty::Int)],
                 ret: Ty::Int,
@@ -717,33 +758,38 @@ fn args_evaluated_left_to_right() {
             },
             TypedFn {
                 name: "main".to_string(),
+                scope: ScopeId(u32::MAX - 2),
                 decl_span: sp(21, 31),
                 params: vec![],
                 ret: Ty::Int,
-                body: do_block(
-                    expr(
+                body: {
+                    let mut body = do_block(
+                        expr(
+                            Ty::Int,
+                            20,
+                            30,
+                            ExprKind::Call {
+                                callee: "second".to_string(),
+                                args: vec![
+                                    expr(
+                                        Ty::Int,
+                                        21,
+                                        26,
+                                        ExprKind::Binary {
+                                            op: BinOp::Div,
+                                            lhs: Box::new(int(1, 21, 22)),
+                                            rhs: Box::new(int(0, 25, 26)),
+                                        },
+                                    ),
+                                    int(42, 28, 30),
+                                ],
+                            },
+                        ),
                         Ty::Int,
-                        20,
-                        30,
-                        ExprKind::Call {
-                            callee: "second".to_string(),
-                            args: vec![
-                                expr(
-                                    Ty::Int,
-                                    21,
-                                    26,
-                                    ExprKind::Binary {
-                                        op: BinOp::Div,
-                                        lhs: Box::new(int(1, 21, 22)),
-                                        rhs: Box::new(int(0, 25, 26)),
-                                    },
-                                ),
-                                int(42, 28, 30),
-                            ],
-                        },
-                    ),
-                    Ty::Int,
-                ),
+                    );
+                    body.scope = ScopeId(1);
+                    body
+                },
             },
         ],
     };

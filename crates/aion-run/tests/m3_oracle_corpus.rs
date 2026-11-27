@@ -42,9 +42,44 @@ fn parse_clean(rel: &str) -> (String, aion_syntax::ParseResult) {
 
 type Sig<'a> = (&'a str, Vec<Ty>, Ty);
 
+/// Test-only block-to-scope map for hand-built models: assigns a fresh
+/// scope id to every block reachable from function bodies, mirroring
+/// the checker's walk, so lowering's fail-closed scope lookup succeeds.
+fn fixture_block_scopes(
+    parse: &aion_syntax::ParseResult,
+    tree: &mut ScopeTree,
+    root: aion_sem_model::ScopeId,
+) -> HashMap<aion_syntax::NodeId, aion_sem_model::ScopeId> {
+    fn go(
+        b: &aion_syntax::Block,
+        bids: &aion_syntax::BlockIds,
+        out: &mut HashMap<aion_syntax::NodeId, aion_sem_model::ScopeId>,
+        tree: &mut ScopeTree,
+        parent: aion_sem_model::ScopeId,
+    ) {
+        let scope = tree.fork(parent).expect("fixture block scope");
+        out.insert(bids.node, scope);
+        for (st, sid) in b.stmts.iter().zip(bids.stmts.iter()) {
+            if let (aion_syntax::Stmt::Block(inner), aion_syntax::StmtIds::Block { body, .. }) =
+                (st, sid)
+            {
+                go(inner, body, out, tree, scope);
+            }
+        }
+    }
+    let mut out = HashMap::new();
+    for (item, iids) in parse.program.items.iter().zip(parse.index.items.iter()) {
+        if let (aion_syntax::Item::Fn(f), aion_syntax::ItemIds::Fn(fids)) = (item, iids) {
+            let function_scope = tree.fork(root).expect("fixture function scope");
+            go(&f.body, &fids.body, &mut out, tree, function_scope);
+        }
+    }
+    out
+}
+
 fn model_for(sigs: &[Sig<'_>]) -> aion_sem_model::SemModel {
     let mut tree = ScopeTree::new();
-    let root = tree.root();
+    let root = tree.root().expect("fixture root allocation");
     for (name, params, ret) in sigs {
         assert!(
             tree.define(
@@ -74,13 +109,31 @@ fn model_for(sigs: &[Sig<'_>]) -> aion_sem_model::SemModel {
 
 fn pipeline(rel: &str, sigs: &[Sig<'_>]) -> (String, aion_ir::ValidatedModule) {
     let (text, r) = parse_clean(rel);
-    let model = model_for(sigs);
-    let (module, diags) = aion_ir::lower(&r, &model, aion_span::FileId(0), text.len() as u32);
+    let mut model = model_for(sigs);
+    // Signatures stay hand-built. Block scopes stay the deterministic
+    // test map. Move facts come only from semantic analysis on this
+    // same parse.
+    let root = model
+        .scope_tree
+        .scopes
+        .iter()
+        .position(|s| s.parent.is_none())
+        .map(|i| aion_sem_model::ScopeId(i as u32))
+        .expect("fixture module root");
+    model.block_scopes = fixture_block_scopes(&r, &mut model.scope_tree, root);
+    let (sema_diags, sema_model) =
+        aion_sema::check_with_model(&r, aion_span::FileId(0), text.as_bytes());
     assert!(
-        diags.is_empty(),
-        "{rel} lower must be clean: {:?}",
-        diags.iter().map(|d| d.render_human()).collect::<Vec<_>>()
+        sema_diags.is_empty(),
+        "{rel} sema must be clean: {:?}",
+        sema_diags
+            .iter()
+            .map(|d| d.render_human())
+            .collect::<Vec<_>>()
     );
+    model.moved_uses = sema_model.moved_uses;
+    let module = aion_ir::lower(&r, &model, aion_span::FileId(0), text.len() as u32)
+        .unwrap_or_else(|diags| panic!("{rel} lower must be clean: {diags:?}"));
     let module = aion_ir::validate(&module).unwrap_or_else(|vdiags| {
         panic!(
             "{rel} validate must be clean: {:?}",

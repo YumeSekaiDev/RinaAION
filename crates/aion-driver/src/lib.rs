@@ -123,10 +123,10 @@ pub fn run(file: aion_span::FileId, bytes: &[u8], config: &aion_run::Config) -> 
         return RunOutcome::Diags(sema_diags);
     }
     // Stage 3: lower (E0014 / index-mismatch stops).
-    let (module, lower_diags) = aion_ir::lower(&parse, &model, file, bytes.len() as u32);
-    if !lower_diags.is_empty() {
-        return RunOutcome::Diags(lower_diags);
-    }
+    let module = match aion_ir::lower(&parse, &model, file, bytes.len() as u32) {
+        Ok(module) => module,
+        Err(lower_diags) => return RunOutcome::Diags(lower_diags),
+    };
     // Stage 4: validate (E0030 stops, incl. duplicate `main`s). Only
     // the validated module crosses into execution (compile-time gate).
     let module = match aion_ir::validate(&module) {
@@ -152,10 +152,10 @@ pub fn dump_ir(file: aion_span::FileId, bytes: &[u8]) -> String {
     if !sema_diags.is_empty() {
         return render_diags(&sema_diags);
     }
-    let (module, lower_diags) = aion_ir::lower(&parse, &model, file, bytes.len() as u32);
-    if !lower_diags.is_empty() {
-        return render_diags(&lower_diags);
-    }
+    let module = match aion_ir::lower(&parse, &model, file, bytes.len() as u32) {
+        Ok(module) => module,
+        Err(lower_diags) => return render_diags(&lower_diags),
+    };
     let module = match aion_ir::validate(&module) {
         Ok(v) => v,
         Err(validate_diags) => return render_diags(&validate_diags),
@@ -203,10 +203,10 @@ pub fn run_trace_json(file: aion_span::FileId, bytes: &[u8], config: &aion_run::
     if !sema_diags.is_empty() {
         return diag_envelope(&sema_diags);
     }
-    let (module, lower_diags) = aion_ir::lower(&parse, &model, file, bytes.len() as u32);
-    if !lower_diags.is_empty() {
-        return diag_envelope(&lower_diags);
-    }
+    let module = match aion_ir::lower(&parse, &model, file, bytes.len() as u32) {
+        Ok(module) => module,
+        Err(lower_diags) => return diag_envelope(&lower_diags),
+    };
     let module = match aion_ir::validate(&module) {
         Ok(v) => v,
         Err(validate_diags) => return diag_envelope(&validate_diags),

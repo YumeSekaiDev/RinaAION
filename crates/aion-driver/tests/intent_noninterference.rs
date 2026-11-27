@@ -133,11 +133,8 @@ fn exec_parse(parse: &ParseResult, bytes: &[u8], config: &Config) -> ExecProject
             .map(|d| (&d.code, &d.message))
             .collect::<Vec<_>>()
     );
-    let (module, lower_diags) = aion_ir::lower(parse, &model, fid(), bytes.len() as u32);
-    assert!(
-        lower_diags.is_empty(),
-        "lowering must be clean: {lower_diags:?}"
-    );
+    let module = aion_ir::lower(parse, &model, fid(), bytes.len() as u32)
+        .unwrap_or_else(|lower_diags| panic!("lowering must be clean: {lower_diags:?}"));
     let module = aion_ir::validate(&module).unwrap_or_else(|ds| {
         panic!(
             "validation must succeed: {:?}",
